@@ -15,8 +15,6 @@
 
 #[cfg(feature = "alsa")]
 pub mod babyface;
-#[cfg(feature = "alsa")]
-pub(crate) mod capture_meter;
 pub mod channel;
 pub(crate) mod curves;
 pub mod device;

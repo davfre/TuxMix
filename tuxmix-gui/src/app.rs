@@ -403,11 +403,11 @@ impl DeviceHandle {
     /// reading for those would risk attributing a level to the wrong
     /// physical input, worse than the honest "N/A" dashes this falls
     /// back to.
-    pub fn has_input_meter(&self, idx: usize) -> bool {
+    pub fn has_input_meter(&self, _idx: usize) -> bool {
         match self {
             DeviceHandle::Mock(_) | DeviceHandle::Usb(_) => true,
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => idx < 2,
+            DeviceHandle::Real(_) => false,
         }
     }
     /// Whether `playback_meters()` is real — true only for Mock. The USB
