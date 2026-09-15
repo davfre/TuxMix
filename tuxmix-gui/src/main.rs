@@ -8,6 +8,7 @@
 //! ```
 
 mod app;
+mod monitor;
 mod layouts;
 mod matrix;
 mod osc;
