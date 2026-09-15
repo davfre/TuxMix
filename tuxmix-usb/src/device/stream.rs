@@ -248,6 +248,23 @@ impl AudioRing {
     }
 }
 
+/// One channel's level over a drain interval.
+///
+/// TotalMix shows both at once: peak as a thin line with zero attack
+/// ("1 sample is enough for a full-scale display") and RMS as the bar,
+/// with "a relatively slow time constant, so that it shows the average
+/// loudness quite well" (RME, *The Channel Strip*). They answer
+/// different questions — peak says whether anything clipped, RMS says
+/// how loud it sounds — so neither substitutes for the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Level {
+    /// Largest |sample| in the interval, 0..1 of full scale.
+    pub peak: f32,
+    /// Root mean square over the interval, 0..1 of full scale. Zero
+    /// when the interval contained no frames.
+    pub rms: f32,
+}
+
 /// Per-channel input-level accumulator for the IN stream (ch0-3 =
 /// AN1-4). Updated from the transfer callback (which runs on the pump
 /// thread, same thread as the reader — the Mutex is uncontended
@@ -259,6 +276,15 @@ pub struct MeterAccum {
     frame_size: usize,
     /// Max |sample| per channel since the last drain (2^23 full scale).
     peak: [u32; 4],
+    /// Sum of squares per channel since the last drain, for RMS.
+    ///
+    /// A sample is at most 2^23, so its square is at most 2^46 and this
+    /// holds 2^18 frames — about 1.4 s at 192 kHz — before it could
+    /// overflow. The UI drains every tick, far short of that, and the
+    /// adds saturate rather than wrap if a caller ever does not.
+    sum_sq: [u64; 4],
+    /// Frames folded in since the last drain, the divisor for the mean.
+    frames: u64,
 }
 
 impl MeterAccum {
@@ -267,6 +293,8 @@ impl MeterAccum {
         Self {
             frame_size,
             peak: [0; 4],
+            sum_sq: [0; 4],
+            frames: 0,
         }
     }
 
@@ -285,19 +313,34 @@ impl MeterAccum {
                     buf[base + c * 4 + 2],
                     buf[base + c * 4 + 3],
                 ]);
-                let mag = ((word as i32) >> 8).unsigned_abs();
+                let sample = (word as i32) >> 8;
+                let mag = sample.unsigned_abs();
                 if mag > self.peak[c] {
                     self.peak[c] = mag;
                 }
+                let sq = (sample as i64 * sample as i64) as u64;
+                self.sum_sq[c] = self.sum_sq[c].saturating_add(sq);
             }
         }
+        self.frames += n as u64;
     }
 
-    /// Peak per channel since the last drain, as 0..1 of full scale,
-    /// and reset the accumulator.
-    fn drain(&mut self) -> [f32; 4] {
-        let out = self.peak.map(|p| p as f32 / FULL_SCALE);
+    /// Peak and RMS per channel since the last drain, as 0..1 of full
+    /// scale, and reset the accumulator.
+    fn drain(&mut self) -> [Level; 4] {
+        let frames = self.frames;
+        let mut out = [Level::default(); 4];
+        for c in 0..4 {
+            out[c].peak = self.peak[c] as f32 / FULL_SCALE;
+            out[c].rms = if frames == 0 {
+                0.0
+            } else {
+                ((self.sum_sq[c] as f64 / frames as f64).sqrt() as f32) / FULL_SCALE
+            };
+        }
         self.peak = [0; 4];
+        self.sum_sq = [0; 4];
+        self.frames = 0;
         out
     }
 }
@@ -508,6 +551,14 @@ impl IntrStream {
     /// full scale) accumulated since the last call, resetting the
     /// accumulator. `None` if this stream has no meter state (OUT).
     pub fn drain_peaks(&self) -> Option<[f32; 4]> {
+        Some(self.drain_levels()?.map(|l| l.peak))
+    }
+
+    /// Drain the per-channel input levels, peak and RMS together
+    /// (ch0-3 = AN1-4, each 0..1 of full scale), and reset the
+    /// accumulator. Same draining convention as [`Self::drain_peaks`]:
+    /// call once per UI tick, not once per channel.
+    pub fn drain_levels(&self) -> Option<[Level; 4]> {
         let meters = self.meters.as_ref()?;
         let mut acc = meters.lock().ok()?;
         Some(acc.drain())
@@ -597,7 +648,7 @@ mod tests {
 
         let mut acc = MeterAccum::new(56); // alt-1 frame (48 kHz)
         acc.accumulate(&buf);
-        let peaks = acc.drain();
+        let peaks = acc.drain().map(|l| l.peak);
         assert!((peaks[0] - 0.5).abs() < 1e-6, "ch0 = {}", peaks[0]);
         assert!((peaks[1] - 0.5).abs() < 1e-6, "ch1 = {}", peaks[1]);
         assert_eq!(peaks[2], 0.0);
@@ -607,6 +658,39 @@ mod tests {
             peaks[3]
         );
         // Draining resets the accumulator.
-        assert_eq!(acc.drain(), [0.0; 4]);
+        assert_eq!(acc.drain(), [Level::default(); 4]);
+    }
+
+    /// Peak answers "did anything reach full scale", RMS answers "how
+    /// loud was it on average", so a half-scale sample followed by
+    /// silence reads 0.5 peak and 0.5/sqrt(2) RMS, not 0.5 for both.
+    #[test]
+    fn rms_averages_over_the_interval_while_peak_does_not() {
+        let mut buf = [0u8; 112]; // two 56-byte frames
+        buf[3] = 0x40; // frame 0, ch0 = +0.5 FS; frame 1 is silence
+
+        let mut acc = MeterAccum::new(56);
+        acc.accumulate(&buf);
+        let l = acc.drain();
+
+        assert!((l[0].peak - 0.5).abs() < 1e-6, "peak = {}", l[0].peak);
+        let want = 0.5 / 2f32.sqrt();
+        assert!((l[0].rms - want).abs() < 1e-6, "rms = {} want {}", l[0].rms, want);
+        assert_eq!(l[1], Level::default());
+    }
+
+    /// A constant-magnitude signal is the one case where the two agree.
+    #[test]
+    fn rms_equals_peak_for_a_constant_magnitude_signal() {
+        let mut buf = [0u8; 112];
+        buf[3] = 0x40; // frame 0, ch0 = +0.5 FS
+        buf[59] = 0xC0; // frame 1, ch0 = -0.5 FS, same magnitude
+
+        let mut acc = MeterAccum::new(56);
+        acc.accumulate(&buf);
+        let l = acc.drain();
+
+        assert!((l[0].peak - 0.5).abs() < 1e-6, "peak = {}", l[0].peak);
+        assert!((l[0].rms - 0.5).abs() < 1e-6, "rms = {}", l[0].rms);
     }
 }

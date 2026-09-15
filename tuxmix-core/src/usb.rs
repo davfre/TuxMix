@@ -25,7 +25,7 @@ use crate::channel::{
     ChannelId, ChannelType, InputChannel, OutputChannel, PlaybackChannel, Sensitivity,
 };
 use crate::curves::{fader_db_to_raw, fader_raw_to_db, FADER_CURVE, FADER_MUTE_RAW};
-use crate::device::{DeviceSettings, RmeDevice};
+use crate::device::{DeviceSettings, Level, RmeDevice};
 use crate::error::Error;
 use crate::panel::{PanelDriver, PanelEvent, PanelState, SelectState};
 use crate::scene::Scene;
@@ -1333,6 +1333,21 @@ impl RmeDevice for BabyfaceProUsb {
 
     fn meters(&self) -> Option<Vec<f32>> {
         self.dev.input_peaks().map(|p| p.to_vec())
+    }
+
+    /// The USB backend computes both from the IN stream: the running
+    /// maximum and the mean square over the same frames. Converted here
+    /// rather than shared, because `tuxmix-usb` is an optional
+    /// dependency and [`RmeDevice`] is not.
+    fn levels(&self) -> Option<Vec<Level>> {
+        self.dev.input_levels().map(|ls| {
+            ls.iter()
+                .map(|l| Level {
+                    peak: l.peak,
+                    rms: l.rms,
+                })
+                .collect()
+        })
     }
 }
 

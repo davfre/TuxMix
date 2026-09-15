@@ -126,6 +126,36 @@ fn default_input_link() -> bool {
     true
 }
 
+/// One channel's level over a metering interval, 0..1 of full scale.
+///
+/// Both numbers, because TotalMix shows both and they answer different
+/// questions: peak has zero attack ("1 sample is enough for a full-scale
+/// display") and says whether anything clipped, while RMS has "a
+/// relatively slow time constant, so that it shows the average loudness
+/// quite well" (RME, *The Channel Strip*).
+///
+/// Defined here rather than re-exported from `tuxmix-usb`, which is an
+/// optional dependency behind the `usb` feature: [`RmeDevice::meters`]
+/// is part of the trait whether or not that feature is on, so its types
+/// cannot come from a crate that might not be compiled in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Level {
+    /// Largest |sample| in the interval.
+    pub peak: f32,
+    /// Root mean square over the interval. Zero when the interval
+    /// contained no frames.
+    pub rms: f32,
+}
+
+impl Level {
+    /// A level that is peak-only: RMS is reported as zero, which the UI
+    /// draws as "no RMS bar" rather than "silent". For backends that
+    /// measure a maximum but not a mean.
+    pub fn peak_only(peak: f32) -> Self {
+        Self { peak, rms: 0.0 }
+    }
+}
+
 /// A generic RME audio interface.
 ///
 /// Each implementation maps to a specific hardware model and knows
@@ -739,6 +769,21 @@ pub trait RmeDevice {
     /// once per channel) — a second call in the same tick returns
     /// zeros.
     fn meters(&self) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Peak and RMS together, for backends that measure both.
+    ///
+    /// `None` means this backend has peaks only (or nothing at all), and
+    /// the UI keeps drawing what [`Self::meters`] gives it. Overriding
+    /// this is opt-in: a backend that does not implement it loses
+    /// nothing.
+    ///
+    /// Same draining convention as [`Self::meters`] — once per tick, not
+    /// once per channel. A backend that implements both must not expect
+    /// them to be called together: whichever the UI uses drains the
+    /// accumulator, and the other then reads zeros.
+    fn levels(&self) -> Option<Vec<Level>> {
         None
     }
 }
