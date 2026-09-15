@@ -975,15 +975,16 @@ impl MeterAnim {
     }
 }
 
-pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -> TuxMix {
-    let mut device = if mock {
-        DeviceHandle::open_mock()
+pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -> Option<TuxMix> {
+    let device = if mock {
+        Some(DeviceHandle::open_mock())
     } else {
-        DeviceHandle::open_real(backend.as_deref()).unwrap_or_else(|| {
-            eprintln!("No device found. Use --mock for simulation.");
-            DeviceHandle::open_mock()
-        })
+        DeviceHandle::open_real(backend.as_deref())
     };
+    device.map(|device| from_device(device, osc_config))
+}
+
+fn from_device(mut device: DeviceHandle, osc_config: Option<OscConfig>) -> TuxMix {
     // Only the direct USB backend needs a saved mixer state. ALSA has
     // live readback: opening the GUI must not overwrite hardware levels.
     if device.restores_saved_mixer() {
@@ -3594,7 +3595,7 @@ mod tests {
 
     #[test]
     fn zoom_in_steps_up_from_default() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         assert_eq!(state.ui_scale, crate::theme::SCALE_DEFAULT);
         zoom(&mut state, ZOOM_STEP);
         assert!(
@@ -3606,7 +3607,7 @@ mod tests {
 
     #[test]
     fn zoom_clamps_to_min_and_max() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         for _ in 0..200 {
             zoom(&mut state, -ZOOM_STEP);
         }
@@ -3622,7 +3623,7 @@ mod tests {
         // The whole point of fixed geometry: a resize must NOT rescale.
         // `zoom` is the only thing that moves `ui_scale`; a resize just
         // updates `window_width` (see `apply_pending_resize`).
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let before = state.ui_scale;
         state.pending_resize_width = Some(700.0);
         apply_pending_resize(&mut state);
@@ -3682,7 +3683,7 @@ mod tests {
 
     #[test]
     fn undo_reverts_a_mute() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Input(0);
         let _ = update(&mut state, Message::Mute(cid, true));
         assert!(state.device.inputs()[0].mute);
@@ -3692,7 +3693,7 @@ mod tests {
 
     #[test]
     fn redo_reapplies_after_undo() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Input(0);
         let _ = update(&mut state, Message::Mute(cid, true));
         let _ = update(&mut state, Message::Undo);
@@ -3703,7 +3704,7 @@ mod tests {
 
     #[test]
     fn a_new_mutating_action_clears_the_redo_stack() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Input(0);
         let _ = update(&mut state, Message::Mute(cid, true));
         let _ = update(&mut state, Message::Undo);
@@ -3717,7 +3718,7 @@ mod tests {
 
     #[test]
     fn ui_only_messages_do_not_grow_the_undo_stack() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let _ = update(&mut state, Message::Tick);
         let _ = update(&mut state, Message::StripHovered(Some(ChannelId::Input(0))));
         assert!(
@@ -3737,7 +3738,7 @@ mod tests {
 
     #[test]
     fn group_mute_link_propagates_to_members() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(4);
         state.selected.insert(a);
@@ -3763,7 +3764,7 @@ mod tests {
     fn group_solo_link_does_not_propagate_mute() {
         // A solo-linked-only group shouldn't cross-propagate mute, and
         // vice versa — the three link types are independent.
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(4);
         state.selected.insert(a);
@@ -3782,7 +3783,7 @@ mod tests {
 
     #[test]
     fn group_fader_link_moves_members_by_the_same_relative_delta() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(4);
         state.selected.insert(a);
@@ -3805,7 +3806,7 @@ mod tests {
 
     #[test]
     fn group_clear_removes_all_membership() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         state.selected.insert(a);
         let _ = update(&mut state, Message::GroupEditToggle);
@@ -3819,7 +3820,7 @@ mod tests {
 
     #[test]
     fn toggle_sidebar_flips_and_is_not_undoable() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         assert!(state.sidebar_open, "sidebar starts expanded");
         let _ = update(&mut state, Message::ToggleSidebar);
         assert!(!state.sidebar_open);
@@ -3833,7 +3834,7 @@ mod tests {
 
     #[test]
     fn global_mute_toggle_mutes_everything_then_unmutes_on_second_press() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         assert!(!all_channels_muted(&state), "mock starts fully unmuted");
 
         let _ = update(&mut state, Message::GlobalMuteToggle);
@@ -3851,7 +3852,7 @@ mod tests {
 
     #[test]
     fn cue_is_exclusive_across_outputs() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Output(0); // pair 0
         let b = ChannelId::Output(2); // pair 1
 
@@ -3876,7 +3877,7 @@ mod tests {
 
     #[test]
     fn eq_for_record_and_optical_out_format_toggles_reach_device_settings() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         assert!(!state.device.settings().eq_for_record);
         assert!(!state.device.settings().optical_out_spdif);
 
@@ -3897,7 +3898,7 @@ mod tests {
 
     #[test]
     fn phase_changed_reaches_the_input_model() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Input(1); // AN2
 
         let _ = update(&mut state, Message::PhaseChanged(cid, true));
@@ -3913,7 +3914,7 @@ mod tests {
         // touched its own (left) channel — Message::Phantom called
         // set_phantom directly, bypassing the new pair-aware
         // set_input_phantom entirely.
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         assert!(state.device.input_pair_linked(0));
         let _ = update(&mut state, Message::Phantom(0, false));
         let _ = update(&mut state, Message::Phantom(1, false));
@@ -3928,7 +3929,7 @@ mod tests {
 
     #[test]
     fn stereo_split_changed_mirrors_across_the_playback_pair() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Playback(0); // PB1 (channels 0/1)
 
         let _ = update(&mut state, Message::StereoSplitChanged(cid, true));
@@ -3947,7 +3948,7 @@ mod tests {
         // second strip silently closed whatever was open on the first —
         // real TotalMix allows several channel-settings panels open at
         // once.
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(2);
 
@@ -3964,7 +3965,7 @@ mod tests {
 
     #[test]
     fn a_second_kind_on_the_same_strip_replaces_the_first_but_route_stays_exclusive_globally() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(2);
 
@@ -3995,7 +3996,7 @@ mod tests {
 
     #[test]
     fn global_mute_toggle_leaves_a_pre_muted_channel_muted_after_restoring() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         // Input(8) is half of a hardware-linked pair by default, so
         // muting it mirrors onto Input(9) too — both are the
         // "independently muted before the global press" channels here.
@@ -4022,7 +4023,7 @@ mod tests {
 
     #[test]
     fn global_solo_toggle_clears_active_solos_without_touching_mute() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(4);
         let _ = update(&mut state, Message::Solo(a, true));
@@ -4037,7 +4038,7 @@ mod tests {
 
     #[test]
     fn global_solo_toggle_restores_the_previously_cleared_solos() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(4);
         let _ = update(&mut state, Message::Solo(a, true));
@@ -4053,7 +4054,7 @@ mod tests {
 
     #[test]
     fn global_solo_toggle_soloing_a_new_channel_after_a_clear_replaces_the_restore_set() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         // Input(0) and Input(8) are each half of a hardware-linked pair
         // by default (see `mock.rs::test_input_pair_linked_by_default`),
         // so soloing either one mirrors onto its sibling too — accounted
@@ -4078,7 +4079,7 @@ mod tests {
 
     #[test]
     fn global_mute_toggle_is_undoable() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let _ = update(&mut state, Message::GlobalMuteToggle);
         assert!(!state.undo_stack.is_empty());
         let _ = update(&mut state, Message::Undo);
@@ -4087,7 +4088,7 @@ mod tests {
 
     #[test]
     fn layout_clicked_recalls_the_stored_collapsed_set() {
-        let mut state = new(true, None, None);
+        let mut state = new(true, None, None).expect("explicit mock opens");
         let cid = ChannelId::Input(0);
         state.layouts[0] = Some(HashSet::from([cid]));
         let _ = update(&mut state, Message::LayoutClicked(1));

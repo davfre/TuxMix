@@ -62,6 +62,25 @@ cargo build
 cargo test          # unit tests (protocol laws, panel state machine, …)
 ```
 
+## Run the GUI
+
+Build and use the loaded ALSA kernel driver:
+
+```sh
+cargo build --release -p tuxmix-gui --features alsa
+./target/release/tuxmix-gui --backend alsa
+```
+
+To try the interface without hardware, start simulation explicitly:
+
+```sh
+./target/release/tuxmix-gui --mock
+```
+
+Without `--mock`, a failed device connection shows a disconnected screen with
+**Retry connection**. It does not start simulation automatically.
+Use `./target/release/tuxmix-gui --help` for all GUI options.
+
 ## License
 
 MIT (userspace application).
