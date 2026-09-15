@@ -9,6 +9,7 @@
 
 mod app;
 mod connection;
+mod single_instance;
 mod monitor;
 mod layouts;
 mod matrix;
@@ -59,6 +60,18 @@ fn main() -> iced::Result {
         return Ok(());
     }
     env_logger::init();
+    // Acquire before opening hardware or restoring any saved mixer state.
+    let _instance = match single_instance::acquire() {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            eprintln!("TuxMix is already running. Use the existing window.");
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("Could not check whether TuxMix is already running: {error}");
+            return Ok(());
+        }
+    };
     let args: Vec<String> = std::env::args().collect();
     let mock = args.iter().any(|a| a == "--mock");
 
