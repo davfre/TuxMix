@@ -1891,6 +1891,10 @@ impl RmeDevice for BabyfacePro {
 
     fn poll_events(&mut self) -> Result<(), Error> {
         let _ = self.mixer.handle_events()?;
+        // The wheel changes driver controls independently of this process.
+        // Some drivers do not emit a volume event for every panel update,
+        // so read the cached ALSA controls even when no event was delivered.
+        self.attach_mixer_elements();
         Ok(())
     }
 

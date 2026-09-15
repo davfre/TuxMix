@@ -105,7 +105,7 @@ impl AlsaMixer {
 
     /// Handle pending ALSA events.
     pub fn handle_events(&self) -> Result<u32, Error> {
-        Ok(0)
+        Ok(self.mixer.handle_events()?)
     }
 
     /// Name of the ALSA card (e.g. "hw:0") — also lets a caller open a
