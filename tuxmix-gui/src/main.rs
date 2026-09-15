@@ -8,6 +8,7 @@
 //! ```
 
 mod app;
+mod connection;
 mod layouts;
 mod matrix;
 mod osc;
@@ -35,7 +36,27 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+const HELP: &str = "TuxMix — RME mixer
+
+Usage: tuxmix-gui [OPTIONS]
+
+Options:
+  -h, --help             Show this help and exit
+  --mock                 Simulate a device without accessing hardware
+  --backend alsa|usb     Select a backend (default: try ALSA, then USB)
+  --osc                  Enable OSC control
+  --osc-port PORT        OSC receive port (default: 9000)
+  --osc-send-port PORT   OSC send port (default: 9001)
+  --osc-host ADDRESS     OSC destination IP address (default: 127.0.0.1)
+
+Without --mock, a failed connection shows a disconnected screen.
+";
+
 fn main() -> iced::Result {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
     let mock = args.iter().any(|a| a == "--mock");
@@ -66,13 +87,13 @@ fn main() -> iced::Result {
     });
 
     iced::application(
-        move || app::new(mock, osc_config.clone(), backend.clone()),
-        app::update,
-        app::view,
+        move || connection::State::new(mock, osc_config.clone(), backend.clone()),
+        connection::update,
+        connection::view,
     )
-    .title(app::title)
-    .subscription(app::subscription)
-    .theme(|_state: &app::TuxMix| iced::Theme::Dark)
+    .title(connection::title)
+    .subscription(connection::subscription)
+    .theme(|_state: &connection::State| iced::Theme::Dark)
     .font(INTER_REGULAR)
     .default_font(Font::with_name("Inter"))
     .window(window::Settings {
