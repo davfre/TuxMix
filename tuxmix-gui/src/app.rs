@@ -294,6 +294,11 @@ impl RmeDevice for DeviceHandle {
 }
 
 impl DeviceHandle {
+    /// ALSA can read live mixer state; saved scenes require an explicit load.
+    fn restores_saved_mixer(&self) -> bool {
+        matches!(self, Self::Usb(_))
+    }
+
     /// Opens the real hardware. `backend` forces a specific path
     /// (`"alsa"` or `"usb"`) — anything else (including `None`) auto-
     /// detects: ALSA (the kernel driver) first, falling back to the
@@ -962,12 +967,9 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
             DeviceHandle::open_mock()
         })
     };
-    // Restore the last mixer state so the UI starts in sync with the
-    // hardware — the USB backend has NO gain/volume readback (only the
-    // 48V/PAD byte is readable), so like TotalMix we re-apply our own
-    // saved state (auto-saved in `Message::Tick`). The file is SHARED
-    // with the TUI, so whichever UI ran last wins.
-    if !mock {
+    // Only the direct USB backend needs a saved mixer state. ALSA has
+    // live readback: opening the GUI must not overwrite hardware levels.
+    if device.restores_saved_mixer() {
         if let Some(scene) = tuxmix_core::scene::load_auto_scene() {
             if let Err(e) = device.apply_scene(&scene) {
                 eprintln!("auto scene load failed: {e:?}");
@@ -1438,10 +1440,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 // GUI/TUI sync: if the OTHER UI wrote auto.json since our
                 // last save, re-apply its state first so we don't clobber
                 // it with our own (possibly stale) copy — then save ours.
-                if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
-                    state.last_saved_json.as_deref(),
-                ) {
-                    let _ = state.device.apply_scene(&their);
+                if state.device.restores_saved_mixer() {
+                    if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
+                        state.last_saved_json.as_deref(),
+                    ) {
+                        let _ = state.device.apply_scene(&their);
+                    }
                 }
                 let scene = state.device.capture_scene();
                 if let Ok(json) = scene.to_json() {
@@ -1458,11 +1462,14 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         // (see the 3 s auto-save in `Message::Tick`). The mock never
         // persists (same reasoning as the auto-save).
         Message::SaveNow => {
+            let _ = state.device.poll_events();
             if !state.device.is_mock() {
-                if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
-                    state.last_saved_json.as_deref(),
-                ) {
-                    let _ = state.device.apply_scene(&their);
+                if state.device.restores_saved_mixer() {
+                    if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
+                        state.last_saved_json.as_deref(),
+                    ) {
+                        let _ = state.device.apply_scene(&their);
+                    }
                 }
                 let scene = state.device.capture_scene();
                 if let Ok(json) = scene.to_json() {

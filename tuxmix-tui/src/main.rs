@@ -353,6 +353,7 @@ impl DeviceHandle {
             self.outputs().len(),
         )
     }
+    fn restores_saved_mixer(&self) -> bool { matches!(self, Self::Usb(_)) }
     fn is_mock(&self) -> bool {
         matches!(self, DeviceHandle::Mock(_))
     }
@@ -579,7 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore the shared auto-saved state (the same `auto.json` the GUI
     // uses) so the two UIs stay in sync — the device has no gain/volume
     // readback. Skip in mock mode (no hardware to write to).
-    if !mock {
+    if device.restores_saved_mixer() {
         if let Some(scene) = tuxmix_core::scene::load_auto_scene() {
             if let Err(e) = device.apply_scene(&scene) {
                 eprintln!("auto scene load failed: {e:?}");
@@ -641,7 +642,7 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>, dev: &mut DeviceHandle) ->
             if let Some(their) =
                 tuxmix_core::scene::auto_scene_written_by_other(last_saved_json.as_deref())
             {
-                let _ = dev.apply_scene(&their);
+                if dev.restores_saved_mixer() { let _ = dev.apply_scene(&their); }
             }
             let scene = dev.capture_scene();
             if let Ok(json) = scene.to_json() {
@@ -699,7 +700,7 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>, dev: &mut DeviceHandle) ->
                             if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
                                 last_saved_json.as_deref(),
                             ) {
-                                let _ = dev.apply_scene(&their);
+                                if dev.restores_saved_mixer() { let _ = dev.apply_scene(&their); }
                             }
                             let scene = dev.capture_scene();
                             let _ = tuxmix_core::scene::save_auto_scene(&scene);
