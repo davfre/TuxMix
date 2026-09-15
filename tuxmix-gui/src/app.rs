@@ -16,6 +16,7 @@ use tuxmix_core::{
 };
 
 use crate::matrix;
+use crate::monitor;
 use crate::osc::{self, OscCommand, OscConfig, OscOutbound};
 use crate::scenes::{load_scene_file, save_scene_file};
 use crate::sidebar::{self, Group};
@@ -527,6 +528,11 @@ pub enum View {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ToggleMonitorPanel,
+    MonitorMain(usize),
+    MonitorPair(usize, bool),
+    MonitorExclusion(monitor::Exclusion),
+
     Tick,
     SetView(View),
     /// The source channel picked in the Quick Control view — always an
@@ -725,6 +731,10 @@ pub enum Message {
 // ── App state ────────────────────────────────────────────────────
 
 pub struct TuxMix {
+    monitor_config: monitor::Config,
+    show_monitor_panel: bool,
+    monitor_error: Option<String>,
+
     pub device: DeviceHandle,
     pub sel_out: usize,
     /// Last front-panel OUT selection seen by `Message::Tick` — when it
@@ -978,6 +988,9 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
     let n_playbacks = device.playbacks().len();
     let n_outputs = device.outputs().len();
     TuxMix {
+        monitor_config: monitor::Config::load(),
+        show_monitor_panel: false,
+        monitor_error: None,
         device,
         sel_out: 0,
         last_panel_out: None,
@@ -1386,6 +1399,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         state.redo_stack.clear();
     }
     match message {
+        Message::ToggleMonitorPanel => state.show_monitor_panel = !state.show_monitor_panel,
+        Message::MonitorMain(main) => { state.monitor_config.main = main.min(5); save_monitor_config(state); }
+        Message::MonitorPair(pair, enabled) => {
+            if pair < 6 { state.monitor_config.monitors[pair] = enabled; save_monitor_config(state); }
+        }
+        Message::MonitorExclusion(exclusion) => { state.monitor_config.exclusion = exclusion; save_monitor_config(state); }
         Message::Tick => {
             // Resize coalescing: if the last `Resized` of a drag landed
             // inside the throttle window, flush it here so the width always
@@ -1885,8 +1904,10 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ToggleSidebar => state.sidebar_open = !state.sidebar_open,
         Message::ToggleSkeletonPair(pair) => state.skeleton_pairs.toggle(pair),
         Message::SnapshotClicked(n) => {
+            let _ = state.device.poll_events();
             state.active_snapshot = Some(n as usize);
             if let Some(scene) = load_scene_file(&format!("Mix {n}")) {
+                let scene = state.monitor_config.protect_snapshot(&scene, &state.device.capture_scene());
                 if let Err(e) = state.device.apply_scene(&scene) {
                     log::warn!("Failed to apply snapshot 'Mix {n}': {e}");
                 }
@@ -2044,7 +2065,9 @@ pub fn view(state: &TuxMix) -> Element<'_, Message> {
     let body = row![content, sidebar::sidebar(state)]
         .width(Length::Fill)
         .height(Length::Fill);
-    let mut col = column![top, body]
+    let mut layout = column![top];
+    if state.show_monitor_panel { layout = layout.push(monitor_panel(state)); }
+    let mut col = layout.push(body)
         .width(Length::Fill)
         .height(Length::Fill);
     if state.show_osc_log {
@@ -2409,6 +2432,7 @@ fn top_bar(state: &TuxMix) -> Element<'_, Message> {
             .color(theme::ACCENT)
             .size(theme::TEXT_XL * scale),
         tab_toggle,
+        button("Monitors").on_press(Message::ToggleMonitorPanel),
         // A small flexible pusher rather than the whole remaining width —
         // `session` below claims the bulk of it (`FillPortion(20)`), so
         // this just keeps it from being flush against `tab_toggle` on a
@@ -4014,4 +4038,23 @@ mod tests {
         assert_eq!(state.active_layout, Some(1));
         assert!(state.collapsed.contains(&cid));
     }
+}
+
+fn save_monitor_config(state: &mut TuxMix) {
+    state.monitor_error = state.monitor_config.save().err();
+}
+
+fn monitor_panel(state: &TuxMix) -> Element<'_, Message> {
+    let c=&state.monitor_config;
+    let mut panel=column![
+        row![text("Main output"),pick_list(OUT_LABELS.to_vec(),Some(OUT_LABELS[c.main]),|label| Message::MonitorMain(OUT_LABELS.iter().position(|v| *v==label).unwrap_or(0)))].spacing(12),
+        text("Monitor outputs (Main is always included):"),
+    ].spacing(8);
+    let mut outputs=row![].spacing(12);
+    for (i,label) in OUT_LABELS.iter().enumerate() {
+        outputs=outputs.push(iced::widget::checkbox(c.monitors[i]).label(*label).on_toggle(move |on|Message::MonitorPair(i,on)));
+    }
+    panel=panel.push(outputs).push(row![text("Snapshot recall"),pick_list(monitor::Exclusion::ALL,Some(c.exclusion),Message::MonitorExclusion)].spacing(12));
+    if let Some(error)=&state.monitor_error {panel=panel.push(text(error));}
+    container(panel).padding(12).into()
 }
