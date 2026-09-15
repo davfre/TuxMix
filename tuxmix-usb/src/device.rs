@@ -20,7 +20,7 @@ use crate::protocol::{self, FlagCounter, VendorRequest};
 mod iso;
 mod stream;
 pub use iso::{IsoStats, IsoStream}; // superseded (isochronous) — kept for reference
-pub use stream::{AudioRing, EventFd, IntrStream, MeterAccum, StreamStats};
+pub use stream::{AudioRing, EventFd, IntrStream, Level, MeterAccum, StreamStats};
 
 /// Babyface Pro FS USB identifiers (proprietary mode).
 pub const VID: u16 = 0x2A39;
@@ -586,6 +586,14 @@ impl BabyfaceUsb {
     /// max |sample| seen since the previous poll.
     pub fn input_peaks(&self) -> Option<[f32; 4]> {
         self.streams.as_ref().and_then(|(_, in_)| in_.drain_peaks())
+    }
+
+    /// Drain the per-channel input levels, peak and RMS together
+    /// (ch0-3 = AN1-4). Draining, like [`Self::input_peaks`]: one call
+    /// per tick, and the two share an accumulator, so calling both in
+    /// the same tick leaves the second reading zeros.
+    pub fn input_levels(&self) -> Option<[Level; 4]> {
+        self.streams.as_ref().and_then(|(_, in_)| in_.drain_levels())
     }
 
     /// Stop streaming and release the audio interface.
