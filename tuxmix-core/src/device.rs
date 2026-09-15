@@ -726,6 +726,9 @@ pub trait RmeDevice {
     /// on DIM presses.
     fn set_dim_press_toggle(&mut self, _on: bool) {}
 
+    /// Physical DIM presses, independent of any software-assigned action.
+    fn dim_button_count(&self) -> Option<u32> { None }
+
     // ── Polling ─────────────────────────────────────────────────
 
     /// Process pending ALSA events (e.g. hardware state changes).

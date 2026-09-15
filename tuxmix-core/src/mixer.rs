@@ -114,6 +114,18 @@ impl AlsaMixer {
         Ok(self.mixer.handle_events()?)
     }
 
+    /// Read the driver counter directly; do not depend on mixer element caching.
+    pub fn dim_button_count(&self) -> Option<u32> {
+        use alsa::ctl::{ElemId, ElemIface, ElemType, ElemValue};
+        let ctl = Ctl::new(&self.card_name, false).ok()?;
+        let mut id = ElemId::new(ElemIface::Mixer);
+        id.set_name(c"DIM Button Press Count");
+        let mut value = ElemValue::new(ElemType::Integer).ok()?;
+        value.set_id(&id);
+        ctl.elem_read(&mut value).ok()?;
+        value.get_integer(0).map(|v| v as u32)
+    }
+
     /// Name of the ALSA card (e.g. "hw:0") — also lets a caller open a
     /// *different* interface on the exact same physical card (e.g. the
     /// capture PCM, for real-time level metering) without re-scanning

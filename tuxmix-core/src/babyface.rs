@@ -2043,6 +2043,10 @@ impl RmeDevice for BabyfacePro {
         self.dim_press_toggles = on;
     }
 
+    fn dim_button_count(&self) -> Option<u32> {
+        self.mixer.dim_button_count()
+    }
+
     fn poll_events(&mut self) -> Result<(), Error> {
         let now = std::time::Instant::now();
         if self.mixer.handle_events()? > 0 {
