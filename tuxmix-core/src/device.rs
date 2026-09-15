@@ -719,6 +719,9 @@ pub trait RmeDevice {
     /// Apply a previously captured [`Scene`] to the hardware.
     fn apply_scene(&mut self, scene: &Scene) -> Result<(), Error>;
 
+    /// Physical DIM presses, independent of any software-assigned action.
+    fn dim_button_count(&self) -> Option<u32> { None }
+
     // ── Polling ─────────────────────────────────────────────────
 
     /// Process pending ALSA events (e.g. hardware state changes).

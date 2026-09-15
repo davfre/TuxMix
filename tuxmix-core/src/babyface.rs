@@ -1873,6 +1873,10 @@ impl RmeDevice for BabyfacePro {
         Ok(())
     }
 
+    fn dim_button_count(&self) -> Option<u32> {
+        self.mixer.dim_button_count()
+    }
+
     fn poll_events(&mut self) -> Result<(), Error> {
         let _ = self.mixer.handle_events()?;
         // The wheel changes driver controls independently of this process.

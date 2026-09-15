@@ -119,6 +119,8 @@ macro_rules! delegate {
 }
 
 impl RmeDevice for DeviceHandle {
+    fn dim_button_count(&self) -> Option<u32> { delegate!(self, dim_button_count) }
+
     fn model_name(&self) -> &str {
         delegate!(self, model_name)
     }
@@ -534,9 +536,12 @@ pub enum View {
 #[derive(Debug, Clone)]
 pub enum Message {
     ToggleMonitorPanel,
+    MonitorAction(monitor::Action),
     MonitorMain(usize),
     MonitorPair(usize, bool),
+    MonitorDimAmount(u8),
     MonitorExclusion(monitor::Exclusion),
+    RunMonitorAction,
 
     Tick,
     SetView(View),
@@ -737,6 +742,8 @@ pub enum Message {
 
 pub struct TuxMix {
     monitor_config: monitor::Config,
+    monitor_runtime: monitor::Runtime,
+    last_dim_press: Option<u32>,
     show_monitor_panel: bool,
     monitor_error: Option<String>,
 
@@ -991,6 +998,8 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
     let n_outputs = device.outputs().len();
     TuxMix {
         monitor_config: monitor::Config::load(),
+        monitor_runtime: monitor::Runtime::default(),
+        last_dim_press: device.dim_button_count(),
         show_monitor_panel: false,
         monitor_error: None,
         device,
@@ -1402,11 +1411,38 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
     }
     match message {
         Message::ToggleMonitorPanel => state.show_monitor_panel = !state.show_monitor_panel,
-        Message::MonitorMain(main) => { state.monitor_config.main = main.min(5); save_monitor_config(state); }
+        Message::MonitorAction(action) => {
+            if !state.monitor_runtime.active() { state.monitor_config.action = action; save_monitor_config(state); }
+        }
+        Message::MonitorMain(main) => {
+            if !state.monitor_runtime.active() { state.monitor_config.main = main.min(5); save_monitor_config(state); }
+        }
         Message::MonitorPair(pair, enabled) => {
-            if pair < 6 { state.monitor_config.monitors[pair] = enabled; save_monitor_config(state); }
+            if !state.monitor_runtime.active() && pair < 6 { state.monitor_config.monitors[pair] = enabled; save_monitor_config(state); }
+        }
+        Message::MonitorDimAmount(db) => {
+            if !state.monitor_runtime.active() { state.monitor_config.dim_db = db.clamp(1,60); save_monitor_config(state); }
         }
         Message::MonitorExclusion(exclusion) => { state.monitor_config.exclusion = exclusion; save_monitor_config(state); }
+        Message::RunMonitorAction => {
+            if state.device.dim_button_count().is_none() && !state.device.is_mock() {
+                state.monitor_error = Some("This driver does not expose assignable DIM button events. Load the monitor-controls driver first.".into());
+                return Task::none();
+            }
+            let action=state.monitor_config.action;
+            if let Some(n)=action.snapshot() { return update(state, Message::SnapshotClicked(n)); }
+            if action == monitor::Action::GlobalMute { return update(state, Message::GlobalMuteToggle); }
+            let spec=match action {
+                monitor::Action::DimMain => Some((false,false)),
+                monitor::Action::DimMonitors => Some((true,false)),
+                monitor::Action::MuteMain => Some((false,true)),
+                monitor::Action::MuteMonitors => Some((true,true)), _ => None,
+            };
+            if let Some((all,mute))=spec {
+                state.monitor_error=state.monitor_runtime.toggle(&mut state.device,&state.monitor_config,all,mute).err();
+                if state.monitor_error.is_some() { state.show_monitor_panel=true; }
+            }
+        }
         Message::Tick => {
             // Resize coalescing: if the last `Resized` of a drag landed
             // inside the throttle window, flush it here so the width always
@@ -1415,6 +1451,15 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             // of a drag.
             apply_pending_resize(state);
             let _ = state.device.poll_events();
+            let count = state.device.dim_button_count();
+            if let (Some(previous), Some(current)) = (state.last_dim_press, count) {
+                let presses = current.wrapping_sub(previous) & 0x7fffffff;
+                // Ignore a reset/reconnected device rather than replaying old presses.
+                if presses > 0 && presses <= 8 {
+                    for _ in 0..presses { let _ = update(state, Message::RunMonitorAction); }
+                }
+            }
+            state.last_dim_press = count;
             // Follow the front panel's OUT selection (TotalMix
             // highlights the panel's current submix) — only when it
             // CHANGES on the panel, so a GUI click on the submix picker
@@ -1911,6 +1956,10 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ToggleSidebar => state.sidebar_open = !state.sidebar_open,
         Message::ToggleSkeletonPair(pair) => state.skeleton_pairs.toggle(pair),
         Message::SnapshotClicked(n) => {
+            if state.monitor_runtime.active() {
+                state.monitor_error = Some("Turn DIM or monitor mute off before recalling a snapshot.".into());
+                return Task::none();
+            }
             let _ = state.device.poll_events();
             state.active_snapshot = Some(n as usize);
             if let Some(scene) = load_scene_file(&format!("Mix {n}")) {
@@ -2439,7 +2488,7 @@ fn top_bar(state: &TuxMix) -> Element<'_, Message> {
             .color(theme::ACCENT)
             .size(theme::TEXT_XL * scale),
         tab_toggle,
-        button("Monitors").on_press(Message::ToggleMonitorPanel),
+        button("Monitor settings").on_press(Message::ToggleMonitorPanel).style(theme::plain_button),
         // A small flexible pusher rather than the whole remaining width —
         // `session` below claims the bulk of it (`FillPortion(20)`), so
         // this just keeps it from being flush against `tab_toggle` on a
@@ -4052,16 +4101,53 @@ fn save_monitor_config(state: &mut TuxMix) {
 }
 
 fn monitor_panel(state: &TuxMix) -> Element<'_, Message> {
-    let c=&state.monitor_config;
-    let mut panel=column![
-        row![text("Main output"),pick_list(OUT_LABELS.to_vec(),Some(OUT_LABELS[c.main]),|label| Message::MonitorMain(OUT_LABELS.iter().position(|v| *v==label).unwrap_or(0)))].spacing(12),
-        text("Monitor outputs (Main is always included):"),
-    ].spacing(8);
-    let mut outputs=row![].spacing(12);
-    for (i,label) in OUT_LABELS.iter().enumerate() {
-        outputs=outputs.push(iced::widget::checkbox(c.monitors[i]).label(*label).on_toggle(move |on|Message::MonitorPair(i,on)));
+    let c = &state.monitor_config;
+    let supported = state.device.is_mock() || state.last_dim_press.is_some();
+    let mut run = button(if state.monitor_runtime.active() { "Restore" } else { "Run action" })
+        .style(theme::plain_button);
+    if supported { run = run.on_press(Message::RunMonitorAction); }
+    let mut outputs = row![].spacing(12);
+    for (i, label) in OUT_LABELS.iter().enumerate() {
+        outputs = outputs.push(iced::widget::checkbox(c.monitors[i]).label(*label)
+            .on_toggle(move |on| Message::MonitorPair(i, on)));
     }
-    panel=panel.push(outputs).push(row![text("Snapshot recall"),pick_list(monitor::Exclusion::ALL,Some(c.exclusion),Message::MonitorExclusion)].spacing(12));
-    if let Some(error)=&state.monitor_error {panel=panel.push(text(error));}
-    container(panel).padding(12).into()
+    let output_section = column![
+        text("Outputs").size(theme::TEXT_MD),
+        row![text("Main output"),
+            pick_list(OUT_LABELS.to_vec(), Some(OUT_LABELS[c.main]), |label|
+                Message::MonitorMain(OUT_LABELS.iter().position(|v| *v == label).unwrap_or(0)))
+                .style(theme::pick_list).menu_style(theme::menu)
+        ].spacing(12).align_y(iced::Alignment::Center),
+        text("Additional monitor outputs (Main is always included)")
+            .size(theme::TEXT_SM).color(theme::TEXT_SEC),
+        outputs,
+    ].spacing(8);
+    let button_section = column![
+        text("DIM button").size(theme::TEXT_MD),
+        row![text("Action"),
+            pick_list(monitor::Action::ALL, Some(c.action), Message::MonitorAction)
+                .style(theme::pick_list).menu_style(theme::menu), run
+        ].spacing(12).align_y(iced::Alignment::Center),
+        row![text(format!("DIM reduction: {} dB", c.dim_db)),
+            iced::widget::slider(1..=60, c.dim_db, Message::MonitorDimAmount).width(160)
+        ].spacing(12).align_y(iced::Alignment::Center),
+    ].spacing(8);
+    let snapshot_section = column![
+        text("Snapshot recall").size(theme::TEXT_MD),
+        pick_list(monitor::Exclusion::ALL, Some(c.exclusion), Message::MonitorExclusion)
+            .style(theme::pick_list).menu_style(theme::menu),
+    ].spacing(8);
+    let mut panel = column![text("Monitor settings").size(18), output_section,
+        button_section, snapshot_section].spacing(16);
+    if state.monitor_runtime.active() {
+        panel = panel.push(text("Restore the active action before changing its assignment, amount or outputs.")
+            .size(theme::TEXT_SM).color(theme::TEXT_SEC));
+    }
+    if !supported {
+        panel = panel.push(text("Button actions require the monitor-controls driver. Snapshot exclusions work independently.")
+            .size(theme::TEXT_SM).color(theme::TEXT_SEC));
+    }
+    if let Some(error) = &state.monitor_error { panel = panel.push(text(error).color(theme::MRED)); }
+    container(scrollable(panel).height(Length::Shrink))
+        .padding(16).max_height(420).width(Length::Fill).style(theme::chip).into()
 }
