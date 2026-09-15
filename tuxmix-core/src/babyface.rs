@@ -316,12 +316,6 @@ pub struct BabyfacePro {
     /// which also keeps this outside `DeviceSettings` (no getter exists
     /// in [`RmeDevice`] for it, only `set_input_link`).
     linked: bool,
-    /// Real-time AN1/AN2 level metering — `None` if the capture PCM
-    /// couldn't be opened (metering is a nice-to-have, not something
-    /// that should keep the rest of the device from working). See
-    /// `capture_meter`'s own module doc comment for why this is scoped
-    /// to just these two channels.
-    capture_meter: Option<crate::capture_meter::CaptureMeter>,
     /// The driver's "DIM Button Press Count" as last seen, `None` when the
     /// control does not exist (an older driver that applied DIM itself,
     /// or the class-compliant mode).  Since `babyface-pro-linux` 1597d28
@@ -1097,24 +1091,13 @@ impl RmeDevice for BabyfacePro {
         };
         info!("ALSA control grammar: {grammar:?}");
 
-        // Requesting just 2 capture channels (not the full 12) lands
-        // exactly on AN1/AN2: the kernel driver's own channel map
-        // (`babyfacepro.c`'s `babyface_capture_copy`) walks `map[i]`
-        // for `i in 0..channels_requested`, and `map[0..2] == [0, 1]`
-        // — device words 0/1, the one mapping confirmed against real
-        // hardware (see `capture_meter`'s module doc comment).
-        let capture_meter = crate::capture_meter::CaptureMeter::start(
-            mixer.card_name(),
-            2,
-            48_000,
-        );
-        if capture_meter.is_none() {
-            log::warn!("Could not open the capture PCM for AN1/AN2 level metering — meters will read N/A");
-        }
+        // A capture stream changes the device's shared sample clock. Mixer
+        // startup must not open a fixed-rate stream behind the user's back.
+        // Input metering remains unavailable until it can use the active rate
+        // without reconfiguring or competing with recording applications.
         let mut device = Self {
             mixer,
             grammar,
-            capture_meter,
             profile,
             inputs: profile.build_inputs(),
             playbacks: profile.build_playbacks(),
@@ -2047,23 +2030,9 @@ impl RmeDevice for BabyfacePro {
         Ok(())
     }
 
-    /// Real for AN1/AN2 (`self.inputs[0]`/`[1]`) via `capture_meter`;
-    /// every other index reads 0.0 here, but the GUI never shows that
-    /// as a real "silent" reading — `DeviceHandle::has_input_meter`
-    /// gates it back to "N/A" for anything past index 1. See
-    /// `capture_meter`'s own module doc comment for why this doesn't
-    /// cover more channels.
-    fn meters(&self) -> Option<Vec<f32>> {
-        let mut levels = vec![0.0; self.inputs.len()];
-        if let Some(cm) = &self.capture_meter {
-            for (i, v) in cm.drain().into_iter().enumerate() {
-                if let Some(slot) = levels.get_mut(i) {
-                    *slot = v;
-                }
-            }
-        }
-        Some(levels)
-    }
+    /// Mixer-only operation does not open a capture stream for meters.
+    fn meters(&self) -> Option<Vec<f32>> { None }
+
 }
 
 #[cfg(test)]
