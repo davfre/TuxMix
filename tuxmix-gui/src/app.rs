@@ -374,52 +374,53 @@ impl DeviceHandle {
                 levels: (0..n).map(|i| d.playback_level(i)).collect(),
                 has_rms: true,
             },
-            // Playback meters come from the OUT stream — not wired yet.
+            // The driver meters the OUT stream as sent.
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => MeterReadings::silent(n),
+            DeviceHandle::Real(d) => match d.playback_levels() {
+                Some(levels) => MeterReadings {
+                    levels,
+                    has_rms: true,
+                },
+                None => MeterReadings::silent(n),
+            },
             DeviceHandle::Usb(_) => MeterReadings::silent(n),
         }
     }
     /// Whether `input_levels()` is a real per-session reading rather than
     /// a hardcoded zero vector — see `draw_meter`'s doc comment in
     /// `widgets/fader.rs`. Mock always has it; the USB backend reads it
-    /// from the device (`meters()`); the ALSA/kernel-driver backend has
-    /// no meter readback at all yet (see `PROTOCOL.md`'s "VU meters:
-    /// conclusion" — the device has none, only host-side computation from
-    /// the ISO streams, which this backend doesn't capture).
+    /// from the device; the ALSA backend has it when the loaded kernel
+    /// driver provides meter controls (`tuxmix_core::driver_meter`).
     pub fn has_input_meters(&self) -> bool {
         match self {
             DeviceHandle::Mock(_) | DeviceHandle::Usb(_) => true,
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => false,
+            DeviceHandle::Real(d) => d.has_meters(),
         }
     }
-    /// Per-channel version of `has_input_meters` — real across the
-    /// board for Mock/USB; on the ALSA/kernel-driver backend, only
-    /// AN1/AN2 (idx 0/1) have a capture-channel mapping confirmed
-    /// against real hardware (`PROTOCOL.md`'s "w0/1 = the AN1/2 record
-    /// bus" + a live mic test). Every other input's capture-word
-    /// mapping is either genuinely contextual (IN3/4 share a word pair
-    /// with the PH3/4 output bus's loopback signal) or disputed between
-    /// `PROTOCOL.md` and the more recent `KERNEL-DRIVER.md` — showing a
-    /// reading for those would risk attributing a level to the wrong
-    /// physical input, worse than the honest "N/A" dashes this falls
-    /// back to.
-    pub fn has_input_meter(&self, _idx: usize) -> bool {
+    /// Per-channel version of `has_input_meters`. On the ALSA backend a
+    /// strip also needs a known capture channel; the digital inputs do
+    /// not have one yet (`BabyfacePro::has_input_meter`), and a reading
+    /// on the wrong strip would be worse than N/A.
+    pub fn has_input_meter(&self, idx: usize) -> bool {
         match self {
             DeviceHandle::Mock(_) | DeviceHandle::Usb(_) => true,
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => false,
+            DeviceHandle::Real(d) => d.has_input_meter(idx),
         }
     }
-    /// Whether `playback_levels()` is real — true only for Mock. The USB
-    /// backend runs its ISO OUT stream in meter-only (silence) mode, so it
-    /// never sees real playback audio to compute a level from even though
-    /// it technically owns the stream — and only one process can hold that
-    /// stream at a time (see `tools/alsa/README.md`'s "Known limits"), so
-    /// real playback audio from another app never reaches it either.
+    /// Whether `playback_levels()` is real. Mock simulates it and the
+    /// ALSA backend reads the driver's playback meters. The USB backend
+    /// runs its ISO OUT stream in meter-only (silence) mode, so it never
+    /// sees real playback audio, and only one process can hold that
+    /// stream (see `tools/alsa/README.md`'s "Known limits").
     pub fn has_playback_meters(&self) -> bool {
-        matches!(self, DeviceHandle::Mock(_))
+        match self {
+            DeviceHandle::Mock(_) => true,
+            DeviceHandle::Usb(_) => false,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Real(d) => d.has_meters(),
+        }
     }
     /// Output meters, computed host-side like TotalMix: each output's
     /// level is the power sum of every routed source (inputs + playbacks)

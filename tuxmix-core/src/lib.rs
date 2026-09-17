@@ -18,6 +18,8 @@ pub mod babyface;
 pub mod channel;
 pub(crate) mod curves;
 pub mod device;
+#[cfg(feature = "alsa")]
+pub mod driver_meter;
 pub mod error;
 #[cfg(feature = "alsa")]
 pub mod mixer;

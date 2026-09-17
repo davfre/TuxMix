@@ -6,7 +6,8 @@ use log::info;
 use crate::channel::OutputChannel;
 use crate::channel::*;
 use crate::curves::{fader_db_to_raw, fader_raw_to_db};
-use crate::device::{DeviceSettings, RmeDevice};
+use crate::device::{DeviceSettings, Level, RmeDevice};
+use crate::driver_meter::{DriverMeters, MeterDir};
 use crate::error::Error;
 use crate::mixer::AlsaMixer;
 use crate::profile::DeviceProfile;
@@ -329,9 +330,50 @@ pub struct BabyfacePro {
     /// When to re-read the card once more after a burst of ALSA events,
     /// see [`RESYNC_SETTLE`].
     resync_at: Option<std::time::Instant>,
+    /// The driver's level meter controls. `None` on a driver that
+    /// predates them and on the class-compliant driver.
+    driver_meters: Option<DriverMeters>,
 }
 
+/// Capture PCM channel for each input strip, or `None` where the
+/// channel is not known yet.
+///
+/// The driver maps capture channels 0-3 to AN1-4 (device words 0-3) and
+/// channels 4-9 to device words 6-11, which it calls ADAT/SPDIF; its
+/// channels 10/11 are a playback tap. Which of the eight digital inputs
+/// (AS1/2, ADAT3-8) those six words carry has not been checked on
+/// hardware, so the digital strips stay N/A until it has.
+fn capture_channel(input: usize) -> Option<usize> {
+    CAPTURE_CHANNEL_FOR_INPUT.get(input).copied().flatten()
+}
+
+const CAPTURE_CHANNEL_FOR_INPUT: [Option<usize>; 12] = [
+    Some(0),
+    Some(1),
+    Some(2),
+    Some(3),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+];
+
 impl BabyfacePro {
+    /// Whether the loaded driver provides level meters.
+    pub fn has_meters(&self) -> bool {
+        self.driver_meters.is_some()
+    }
+
+    /// Whether input strip `idx` has a meter: the driver provides
+    /// meters and the strip's capture channel is known.
+    pub fn has_input_meter(&self, idx: usize) -> bool {
+        self.has_meters() && capture_channel(idx).is_some()
+    }
+
     /// Look up a crosspoint's ALSA element: `BF_SOURCES[src]` at
     /// `.index = output*14 + src`, exactly `mixer.c`'s
     /// `babyface_create_xpoints` layout.
@@ -1091,10 +1133,13 @@ impl RmeDevice for BabyfacePro {
         };
         info!("ALSA control grammar: {grammar:?}");
 
-        // A capture stream changes the device's shared sample clock. Mixer
-        // startup must not open a fixed-rate stream behind the user's back.
-        // Input metering remains unavailable until it can use the active rate
-        // without reconfiguring or competing with recording applications.
+        // Meters come from the driver's controls, never from a capture
+        // stream of our own: that would change the shared sample clock
+        // and hold the card's only capture substream.
+        let driver_meters = match grammar {
+            ControlGrammar::Proprietary => DriverMeters::open(mixer.card_name()),
+            ControlGrammar::ClassCompliant => None,
+        };
         let mut device = Self {
             mixer,
             grammar,
@@ -1126,6 +1171,7 @@ impl RmeDevice for BabyfacePro {
             dim_press_count: None,
             panel: None,
             resync_at: None,
+            driver_meters,
         };
         device.attach_mixer_elements(false);
         Ok(device)
@@ -2030,9 +2076,32 @@ impl RmeDevice for BabyfacePro {
         Ok(())
     }
 
-    /// Mixer-only operation does not open a capture stream for meters.
-    fn meters(&self) -> Option<Vec<f32>> { None }
+    fn meters(&self) -> Option<Vec<f32>> {
+        self.levels()
+            .map(|levels| levels.iter().map(|l| l.peak).collect())
+    }
 
+    /// Input levels from the driver's capture meters, in input-strip
+    /// order. Strips without a known capture channel read zero; the GUI
+    /// shows them as N/A through [`BabyfacePro::has_input_meter`].
+    fn levels(&self) -> Option<Vec<Level>> {
+        let capture = self.driver_meters.as_ref()?.read(MeterDir::Capture)?;
+        Some(
+            (0..self.inputs.len())
+                .map(|i| capture_channel(i).map_or(Level::default(), |ch| capture[ch]))
+                .collect(),
+        )
+    }
+
+    /// Playback strip n is playback PCM channel n.
+    fn playback_levels(&self) -> Option<Vec<Level>> {
+        let playback = self.driver_meters.as_ref()?.read(MeterDir::Playback)?;
+        Some(
+            (0..self.playbacks.len())
+                .map(|i| playback.get(i).copied().unwrap_or_default())
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2073,6 +2142,16 @@ mod tests {
         // ...a wheel click (0.5 dB, about 6 %) is well above it.
         assert!(resync_differs(0.5, 0.53));
         assert!(resync_differs(0.0, 0.01));
+    }
+
+    #[test]
+    fn capture_channel_table_covers_every_input() {
+        assert_eq!(CAPTURE_CHANNEL_FOR_INPUT.len(), PROFILE.input_count());
+        let mut seen = std::collections::HashSet::new();
+        for ch in CAPTURE_CHANNEL_FOR_INPUT.iter().flatten() {
+            assert!(*ch < crate::driver_meter::CHANNELS);
+            assert!(seen.insert(*ch), "capture channel {ch} used twice");
+        }
     }
 
     #[test]

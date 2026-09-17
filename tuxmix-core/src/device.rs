@@ -783,4 +783,12 @@ pub trait RmeDevice {
     fn levels(&self) -> Option<Vec<Level>> {
         None
     }
+
+    /// Peak and RMS for the playback channels, in playback-strip order.
+    /// `None` when the backend cannot measure what is played. Same
+    /// draining convention as [`Self::levels`], with its own
+    /// accumulator.
+    fn playback_levels(&self) -> Option<Vec<Level>> {
+        None
+    }
 }
