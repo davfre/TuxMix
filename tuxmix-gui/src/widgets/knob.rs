@@ -240,6 +240,7 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
                         prev: display.at(*now),
                         value: self.value,
                         since: *now,
+                        rms: None,
                     };
                 }
                 if display.is_settling(*now) {

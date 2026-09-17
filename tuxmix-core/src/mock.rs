@@ -11,7 +11,7 @@
 use rand::Rng;
 
 use crate::channel::*;
-use crate::device::{DeviceSettings, RmeDevice};
+use crate::device::{DeviceSettings, Level, RmeDevice};
 use crate::error::Error;
 use crate::profiles::babyface_pro::PROFILE;
 use crate::scene::Scene;
@@ -33,23 +33,55 @@ pub struct MockBabyfacePro {
     settings: DeviceSettings,
     input_meters: Vec<f32>,
     playback_meters: Vec<f32>,
+    /// RMS alongside each peak, so the GUI's RMS bar has something to
+    /// draw without hardware. Kept below its peak by a wandering crest
+    /// factor, the way programme material behaves.
+    input_rms: Vec<f32>,
+    playback_rms: Vec<f32>,
     tick: u64,
 }
+
+/// Crest factor range for the mock's RMS, as an RMS/peak ratio: about
+/// 3 dB (a sine) down to about 12 dB (drums).
+const MOCK_RMS_RATIO: std::ops::Range<f32> = 0.25..0.707;
 
 impl MockBabyfacePro {
     fn update_meters(&mut self) {
         let mut rng = rand::thread_rng();
         self.tick += 1;
 
-        for v in &mut self.input_meters {
+        for (v, r) in self.input_meters.iter_mut().zip(&mut self.input_rms) {
             let target = rng.gen_range(0.0..0.95);
             *v += (target - *v) * 0.05;
             *v = v.clamp(0.0, 1.0);
+            let ratio = rng.gen_range(MOCK_RMS_RATIO);
+            *r += (*v * ratio - *r) * 0.05;
+            *r = r.clamp(0.0, *v);
         }
-        for v in &mut self.playback_meters {
+        for (v, r) in self.playback_meters.iter_mut().zip(&mut self.playback_rms) {
             let target = rng.gen_range(0.0..0.85);
             *v += (target - *v) * 0.03;
             *v = v.clamp(0.0, 1.0);
+            let ratio = rng.gen_range(MOCK_RMS_RATIO);
+            *r += (*v * ratio - *r) * 0.03;
+            *r = r.clamp(0.0, *v);
+        }
+    }
+
+    /// Peak and RMS for one input. Not draining, unlike
+    /// [`RmeDevice::levels`] on the USB backend.
+    pub fn input_level(&self, idx: usize) -> Level {
+        Level {
+            peak: self.input_meter(idx),
+            rms: self.input_rms.get(idx).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// Peak and RMS for one playback channel.
+    pub fn playback_level(&self, idx: usize) -> Level {
+        Level {
+            peak: self.playback_meter(idx),
+            rms: self.playback_rms.get(idx).copied().unwrap_or(0.0),
         }
     }
 
@@ -173,6 +205,8 @@ impl RmeDevice for MockBabyfacePro {
             },
             input_meters: vec![0.0; PROFILE.input_count()],
             playback_meters: vec![0.0; PROFILE.output_pair_count() * 2],
+            input_rms: vec![0.0; PROFILE.input_count()],
+            playback_rms: vec![0.0; PROFILE.output_pair_count() * 2],
             tick: 0,
         })
     }
@@ -662,6 +696,18 @@ impl RmeDevice for MockBabyfacePro {
         self.update_meters();
         Ok(())
     }
+
+    fn meters(&self) -> Option<Vec<f32>> {
+        Some(self.input_meters.clone())
+    }
+
+    fn levels(&self) -> Option<Vec<Level>> {
+        Some(
+            (0..self.input_meters.len())
+                .map(|i| self.input_level(i))
+                .collect(),
+        )
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -772,6 +818,23 @@ mod tests {
         for v in dev.playback_meters() {
             assert!(*v >= 0.0 && *v <= 1.0, "Meter {} out of range", v);
         }
+    }
+
+    #[test]
+    fn test_rms_stays_at_or_below_peak() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        for _ in 0..200 {
+            dev.poll_events().unwrap();
+            for i in 0..dev.input_meters().len() {
+                let l = dev.input_level(i);
+                assert!(l.rms >= 0.0 && l.rms <= l.peak, "input {i}: {l:?}");
+            }
+            for i in 0..dev.playback_meters().len() {
+                let l = dev.playback_level(i);
+                assert!(l.rms >= 0.0 && l.rms <= l.peak, "playback {i}: {l:?}");
+            }
+        }
+        assert!(dev.levels().unwrap().iter().any(|l| l.rms > 0.0));
     }
 
     #[test]

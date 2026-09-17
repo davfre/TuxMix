@@ -24,11 +24,32 @@ const METER_INTERP_MS: f32 = 50.0;
 /// settling back to the normal `Tick`-driven redraw rate once caught up —
 /// full-refresh-rate motion without polling the device or rebuilding the
 /// view any more often than before.
+///
+/// `value` is the peak. `rms` is the RMS keyframe pair on the same clock,
+/// `None` when the backend measures peaks only. The fader cap reuses this
+/// type for its own easing and always leaves `rms` at `None`.
 #[derive(Clone, Copy, Debug)]
 pub struct MeterFrame {
     pub prev: f32,
     pub value: f32,
     pub since: Instant,
+    pub rms: Option<RmsFrame>,
+}
+
+/// The RMS half of a [`MeterFrame`]: start and end of the current
+/// keyframe transition, interpolated over the same `since` window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RmsFrame {
+    pub prev: f32,
+    pub value: f32,
+}
+
+/// One meter's level at draw time: the peak, and the RMS when the
+/// backend measures it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterReading {
+    pub peak: f32,
+    pub rms: Option<f32>,
 }
 
 impl MeterFrame {
@@ -39,18 +60,34 @@ impl MeterFrame {
             prev: value,
             value,
             since: Instant::now(),
+            rms: None,
         }
     }
 
+    fn progress(&self, now: Instant) -> f32 {
+        (now.duration_since(self.since).as_secs_f32() * 1000.0 / METER_INTERP_MS).clamp(0.0, 1.0)
+    }
+
     pub(crate) fn at(&self, now: Instant) -> f32 {
-        let t = (now.duration_since(self.since).as_secs_f32() * 1000.0 / METER_INTERP_MS)
-            .clamp(0.0, 1.0);
+        let t = self.progress(now);
         self.prev + (self.value - self.prev) * t
     }
 
+    /// Peak and RMS interpolated to `now`.
+    pub(crate) fn reading_at(&self, now: Instant) -> MeterReading {
+        let t = self.progress(now);
+        MeterReading {
+            peak: self.prev + (self.value - self.prev) * t,
+            rms: self.rms.map(|r| r.prev + (r.value - r.prev) * t),
+        }
+    }
+
     pub(crate) fn is_settling(&self, now: Instant) -> bool {
-        (self.value - self.prev).abs() > f32::EPSILON
-            && now.duration_since(self.since).as_secs_f32() * 1000.0 < METER_INTERP_MS
+        let moving = (self.value - self.prev).abs() > f32::EPSILON
+            || self
+                .rms
+                .is_some_and(|r| (r.value - r.prev).abs() > f32::EPSILON);
+        moving && now.duration_since(self.since).as_secs_f32() * 1000.0 < METER_INTERP_MS
     }
 }
 
@@ -451,6 +488,7 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
                             prev: display.at(*now),
                             value: self.value,
                             since: *now,
+                            rms: None,
                         };
                     }
                     still_animating |= display.is_settling(*now);
@@ -483,14 +521,15 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
             );
             // Meter first, as a translucent wash; ruler ticks drawn on top
             // of it so both share the column instead of splitting the strip.
+            let now = Instant::now();
             draw_meter(
                 &mut frame,
                 meter_rect,
-                self.meter.at(Instant::now()),
+                self.meter.reading_at(now),
                 self.scale,
                 self.meter_available,
                 self.meter2
-                    .map(|m| (m.at(Instant::now()), self.meter2_available)),
+                    .map(|m| (m.reading_at(now), self.meter2_available)),
             );
             draw_ruler(&mut frame, meter_rect, self.scale);
         }
@@ -621,10 +660,10 @@ const FILL_ALPHA: f32 = 0.55;
 fn draw_meter(
     frame: &mut Frame,
     r: Rectangle,
-    level: f32,
+    level: MeterReading,
     scale: f32,
     available: bool,
-    right: Option<(f32, bool)>,
+    right: Option<(MeterReading, bool)>,
 ) {
     let Some((level2, available2)) = right else {
         draw_meter_bar(frame, r, level, scale, available);
@@ -641,8 +680,37 @@ fn draw_meter(
     draw_meter_bar(frame, right_rect, level2, scale, available2);
 }
 
-fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, available: bool) {
-    let l = level.clamp(0.0, 1.0);
+/// Height of the peak marker drawn over an RMS fill, at `scale == 1.0`.
+const PEAK_LINE_H: f32 = 2.0;
+
+/// Fill color for a level: green, tinting toward red above
+/// `HOT_THRESHOLD`.
+fn level_color(l: f32, alpha: f32) -> Color {
+    let hot_t = (l - HOT_THRESHOLD) / (1.0 - HOT_THRESHOLD);
+    Color {
+        a: alpha,
+        ..lerp_color(theme::MGREEN, theme::MRED, hot_t)
+    }
+}
+
+/// Where a level lands in the column, as a y coordinate. Uses the tapered
+/// fader curve so a level lines up with its ruler tick.
+fn level_top(r: Rectangle, l: f32) -> f32 {
+    r.y + r.height - r.height * vol_to_t(l)
+}
+
+/// With RMS, the fill shows RMS and a thin line marks the peak above it,
+/// the way TotalMix draws both at once. Without it (`level.rms` is
+/// `None`, a peak-only backend) the fill shows the peak, as before.
+fn draw_meter_bar(
+    frame: &mut Frame,
+    r: Rectangle,
+    level: MeterReading,
+    scale: f32,
+    available: bool,
+) {
+    let l = level.peak.clamp(0.0, 1.0);
+    let fill_l = level.rms.map_or(l, |rms| rms.clamp(0.0, l));
     let fill_w = r.width;
     let radius = METER_RADIUS * scale;
     let clip_h = CLIP_H * scale;
@@ -687,7 +755,7 @@ fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, avail
         return;
     }
 
-    if l > 0.0 {
+    if fill_l > 0.0 {
         // `l` is linear amplitude (1.0 = 0 dBFS), but the ruler's
         // ticks — and the fader track right next to this column — are
         // positioned on the *tapered* dB curve (`db_to_t`/`vol_to_t`),
@@ -697,16 +765,25 @@ fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, avail
         // signal data only started flowing through here this session
         // (previously every real backend read "N/A"), which is what
         // made this actually matter rather than being a latent bug.
-        let fill_h = r.height * vol_to_t(l);
-        let fill_pos = Point::new(r.x, r.y + r.height - fill_h);
-        let hot_t = (l - HOT_THRESHOLD) / (1.0 - HOT_THRESHOLD);
-        let fill_color = Color {
-            a: FILL_ALPHA,
-            ..lerp_color(theme::MGREEN, theme::MRED, hot_t)
-        };
+        let fill_top = level_top(r, fill_l);
+        let fill_h = r.y + r.height - fill_top;
+        let fill_pos = Point::new(r.x, fill_top);
         frame.fill(
             &Path::new(|b| b.rounded_rectangle(fill_pos, Size::new(fill_w, fill_h), radius.into())),
-            fill_color,
+            level_color(fill_l, FILL_ALPHA),
+        );
+    }
+
+    if level.rms.is_some() && l > 0.0 {
+        // Opaque, so the peak reads clearly over the translucent fill and
+        // the ruler digits. Kept inside the column so it never overlaps
+        // the clip LED's rounded ends.
+        let line_h = PEAK_LINE_H * scale;
+        let y = safe_clamp(level_top(r, l), r.y, r.y + r.height - line_h);
+        frame.fill_rectangle(
+            Point::new(r.x, y),
+            Size::new(fill_w, line_h),
+            level_color(l, 1.0),
         );
     }
 
@@ -977,7 +1054,7 @@ impl<Message> canvas::Program<Message> for VuMeter {
         draw_meter(
             &mut frame,
             meter_rect,
-            self.level.at(Instant::now()),
+            self.level.reading_at(Instant::now()),
             self.scale,
             self.available,
             // Collapsed strips are a glance-only view with no room for a
@@ -1045,6 +1122,7 @@ mod tests {
             prev: 0.2,
             value: 0.8,
             since: Instant::now(),
+            rms: None,
         };
         assert!(
             f.is_settling(f.since),
@@ -1066,6 +1144,7 @@ mod tests {
             prev: 0.0,
             value: 1.0,
             since: Instant::now(),
+            rms: None,
         };
         assert_eq!(f.at(f.since), 0.0);
         assert_eq!(f.at(f.since + Duration::from_millis(50)), 1.0);
@@ -1074,6 +1153,53 @@ mod tests {
             (mid - 0.5).abs() < 0.01,
             "expected ~0.5 at the midpoint, got {mid}"
         );
+    }
+
+    #[test]
+    fn reading_interpolates_rms_on_the_peak_clock() {
+        let f = MeterFrame {
+            prev: 0.2,
+            value: 0.6,
+            since: Instant::now(),
+            rms: Some(RmsFrame {
+                prev: 0.1,
+                value: 0.3,
+            }),
+        };
+        let mid = f.reading_at(f.since + Duration::from_millis(25));
+        assert!((mid.peak - 0.4).abs() < 0.01, "{mid:?}");
+        assert!((mid.rms.unwrap() - 0.2).abs() < 0.01, "{mid:?}");
+        let end = f.reading_at(f.since + Duration::from_millis(50));
+        assert_eq!(
+            end,
+            MeterReading {
+                peak: 0.6,
+                rms: Some(0.3)
+            }
+        );
+    }
+
+    #[test]
+    fn peak_only_frame_reads_no_rms() {
+        let f = MeterFrame::still(0.5);
+        assert_eq!(f.reading_at(f.since).rms, None);
+    }
+
+    #[test]
+    fn rms_movement_alone_keeps_the_frame_settling() {
+        // Peak held steady while RMS still moves: the meter must keep
+        // requesting redraws, or the RMS bar would stair-step.
+        let f = MeterFrame {
+            prev: 0.5,
+            value: 0.5,
+            since: Instant::now(),
+            rms: Some(RmsFrame {
+                prev: 0.1,
+                value: 0.3,
+            }),
+        };
+        assert!(f.is_settling(f.since + Duration::from_millis(10)));
+        assert!(!f.is_settling(f.since + Duration::from_millis(60)));
     }
 
     #[test]

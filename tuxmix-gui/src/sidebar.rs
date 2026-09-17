@@ -331,11 +331,9 @@ fn panel_header(label: &str, open: bool, on_toggle: Message, scale: f32) -> Elem
 /// `2 row`/`solo mode`) and the permanently-fixed `routing` row — one
 /// side highlighted, the other not, `on_press` wired on both (skeleton)
 /// or neither (fixed `routing`: "submix" is always the highlighted
-/// side, so there's nothing to press toward). For a row where *neither*
-/// side should ever look engaged (the `meters` row — see
-/// `disabled_segmented_row`), use that instead: passing `left_active:
-/// false` here still lights the *right* side, which is correct for an
-/// actual exclusive pair but wrong for "both are simply off."
+/// side, so there's nothing to press toward). Passing `left_active:
+/// false` lights the *right* side, which is right for an exclusive pair
+/// but wrong for two independent settings (see `meters_row`).
 fn segmented_row<'a>(
     left_label: &'a str,
     right_label: &'a str,
@@ -360,29 +358,32 @@ fn segmented_row<'a>(
     .into()
 }
 
-/// A 2-way segmented row where *neither* side is real — both rendered
-/// dimmed (40% text alpha, same treatment as the Output strip's inert
-/// balance knob, `Knob::interactive: false`) and unpressable, for
-/// Options rows that don't map to anything in this app's architecture
-/// (`meters: post fx / RMS` — no on-device meter register, no RMS
-/// ballistics, no post-FX tap point since no FX exists at all).
-fn disabled_segmented_row(left_label: &str, right_label: &str, scale: f32) -> Element<'static, Message> {
-    let dim = Color { a: 0.4, ..theme::TEXT_SEC };
-    let cell = |label: String| -> Element<'static, Message> {
-        button(text(label).size(theme::TEXT_XS * scale).color(dim))
+/// The Options `meters` row: a dimmed, inert "post fx" cell beside an
+/// independent "RMS +3 dB" on/off button. Not a segmented pair: the two
+/// are separate settings, so turning one on must not light the other.
+fn meters_row(rms_plus3: bool, scale: f32) -> Element<'static, Message> {
+    let dim = Color {
+        a: 0.4,
+        ..theme::TEXT_SEC
+    };
+    row![
+        button(text("post fx").size(theme::TEXT_XS * scale).color(dim))
             .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
             .width(Length::Fill)
-            .style(theme::plain_button)
-            .into()
-    };
-    row![cell(left_label.to_string()), cell(right_label.to_string())]
-        .spacing(theme::SPACE_TIGHT * scale)
-        .into()
+            .style(theme::plain_button),
+        button(text("RMS +3 dB").size(theme::TEXT_XS * scale))
+            .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+            .width(Length::Fill)
+            .style(theme::toggle_button(rms_plus3, theme::ACCENT))
+            .on_press(Message::ToggleRmsPlus3),
+    ]
+    .spacing(theme::SPACE_TIGHT * scale)
+    .into()
 }
 
-/// Real where the app has something to report (`routing`/`meters` are
-/// permanently-fixed readouts of this app's own architecture, not
-/// switches), skeleton everywhere the reference's exact behavior isn't
+/// Real where the app has something to report (`routing` is a
+/// permanently-fixed readout of this app's own architecture, `meters`
+/// has the working "RMS +3 dB" switch), skeleton everywhere the reference's exact behavior isn't
 /// confirmed (`show`/`2 row`/`solo mode`) — see `SkeletonPair`'s own
 /// doc comment.
 fn options_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
@@ -409,10 +410,10 @@ fn options_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
     col = col.push(segmented_row("submix", "free", true, None, None, scale));
 
     col = col.push(label("meters"));
-    // Permanently fixed, both disabled — no on-device meter register,
-    // no RMS ballistics, no post-FX tap point (no FX exists at all).
-    // See `GUI-NOTES.md`'s "VU meters: conclusion".
-    col = col.push(disabled_segmented_row("post fx", "RMS", scale));
+    // "post fx" stays disabled: there is no FX, so no post-FX tap point.
+    // "RMS +3 dB" is real: it lifts the RMS bar so a sine reads the same
+    // on RMS and peak.
+    col = col.push(meters_row(state.rms_plus3, scale));
 
     col = col.push(label("show"));
     col = col.push(segmented_row(

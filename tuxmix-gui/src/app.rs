@@ -12,7 +12,7 @@ use tuxmix_core::channel::EqBandType;
 #[cfg(feature = "alsa")]
 use tuxmix_core::BabyfacePro;
 use tuxmix_core::{
-    BabyfaceProUsb, ChannelId, ChannelType, MockBabyfacePro, RmeDevice, Scene, Sensitivity,
+    BabyfaceProUsb, ChannelId, ChannelType, Level, MockBabyfacePro, RmeDevice, Scene, Sensitivity,
 };
 
 use crate::matrix;
@@ -352,28 +352,35 @@ impl DeviceHandle {
     pub fn open_mock() -> Self {
         DeviceHandle::Mock(MockBabyfacePro::open().expect("mock opens"))
     }
-    /// All input meter levels in one call (the USB backend's
-    /// `meters()` is draining — call once per tick, not per channel).
-    pub fn input_meters(&self) -> Vec<f32> {
+    /// All input levels in one call. The real backends drain their
+    /// accumulators on every read, so call this once per tick, not per
+    /// channel, and not alongside anything else that reads meters.
+    pub fn input_levels(&self) -> MeterReadings {
         let n = self.inputs().len();
         match self {
-            DeviceHandle::Mock(d) => (0..n).map(|i| d.input_meter(i)).collect(),
-            DeviceHandle::Usb(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
+            DeviceHandle::Mock(d) => MeterReadings {
+                levels: (0..n).map(|i| d.input_level(i)).collect(),
+                has_rms: true,
+            },
+            DeviceHandle::Usb(d) => MeterReadings::drain(d, n),
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
+            DeviceHandle::Real(d) => MeterReadings::drain(d, n),
         }
     }
-    pub fn playback_meters(&self) -> Vec<f32> {
+    pub fn playback_levels(&self) -> MeterReadings {
         let n = self.playbacks().len();
         match self {
-            DeviceHandle::Mock(d) => (0..n).map(|i| d.playback_meter(i)).collect(),
+            DeviceHandle::Mock(d) => MeterReadings {
+                levels: (0..n).map(|i| d.playback_level(i)).collect(),
+                has_rms: true,
+            },
             // Playback meters come from the OUT stream — not wired yet.
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => vec![0.0; n],
-            DeviceHandle::Usb(_) => vec![0.0; n],
+            DeviceHandle::Real(_) => MeterReadings::silent(n),
+            DeviceHandle::Usb(_) => MeterReadings::silent(n),
         }
     }
-    /// Whether `input_meters()` is a real per-session reading rather than
+    /// Whether `input_levels()` is a real per-session reading rather than
     /// a hardcoded zero vector — see `draw_meter`'s doc comment in
     /// `widgets/fader.rs`. Mock always has it; the USB backend reads it
     /// from the device (`meters()`); the ALSA/kernel-driver backend has
@@ -405,7 +412,7 @@ impl DeviceHandle {
             DeviceHandle::Real(_) => idx < 2,
         }
     }
-    /// Whether `playback_meters()` is real — true only for Mock. The USB
+    /// Whether `playback_levels()` is real — true only for Mock. The USB
     /// backend runs its ISO OUT stream in meter-only (silence) mode, so it
     /// never sees real playback audio to compute a level from even though
     /// it technically owns the stream — and only one process can hold that
@@ -420,14 +427,50 @@ impl DeviceHandle {
     /// `power_sum_output_meters`'s own doc comment for the actual math —
     /// pulled out as a free function so it's testable with deterministic
     /// inputs, since the mock backend's own meter readings are randomized.
-    pub fn output_meters(&self) -> Vec<f32> {
-        power_sum_output_meters(
-            &self.inputs().iter().map(|c| c.volumes.clone()).collect::<Vec<_>>(),
-            &self.input_meters(),
-            &self.playbacks().iter().map(|c| c.volumes.clone()).collect::<Vec<_>>(),
-            &self.playback_meters(),
-            self.outputs().len(),
-        )
+    ///
+    /// Takes this tick's input and playback readings rather than reading
+    /// them itself: a second read in the same tick would drain the real
+    /// backends' accumulators again and get zeros back.
+    ///
+    /// RMS is summed the same way as peak. For uncorrelated sources that
+    /// is the RMS of the mix; for peaks it stays an estimate, as before.
+    pub fn output_levels(
+        &self,
+        inputs: &MeterReadings,
+        playbacks: &MeterReadings,
+    ) -> MeterReadings {
+        let in_vols = self
+            .inputs()
+            .iter()
+            .map(|c| c.volumes.clone())
+            .collect::<Vec<_>>();
+        let pb_vols = self
+            .playbacks()
+            .iter()
+            .map(|c| c.volumes.clone())
+            .collect::<Vec<_>>();
+        let n_out = self.outputs().len();
+        let peaks = |r: &MeterReadings| r.levels.iter().map(|l| l.peak).collect::<Vec<_>>();
+        let rmss = |r: &MeterReadings| r.levels.iter().map(|l| l.rms).collect::<Vec<_>>();
+        let peak =
+            power_sum_output_meters(&in_vols, &peaks(inputs), &pb_vols, &peaks(playbacks), n_out);
+        // A source without RMS would add nothing to the sum and make the
+        // output read low, so outputs get RMS only when every source that
+        // is really measured has it.
+        let has_rms = inputs.has_rms && (playbacks.has_rms || !self.has_playback_meters());
+        let rms = if has_rms {
+            power_sum_output_meters(&in_vols, &rmss(inputs), &pb_vols, &rmss(playbacks), n_out)
+        } else {
+            vec![0.0; n_out]
+        };
+        MeterReadings {
+            levels: peak
+                .into_iter()
+                .zip(rms)
+                .map(|(peak, rms)| Level { peak, rms })
+                .collect(),
+            has_rms,
+        }
     }
     pub fn is_mock(&self) -> bool {
         matches!(self, DeviceHandle::Mock(_))
@@ -466,7 +509,48 @@ impl DeviceHandle {
     }
 }
 
-/// The actual math behind `DeviceHandle::output_meters` — each output
+/// One tick's levels for a group of strips.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeterReadings {
+    pub levels: Vec<Level>,
+    /// Whether `levels[..].rms` was measured. `false` for a peak-only
+    /// backend, whose RMS reads zero and must not be drawn as silence.
+    pub has_rms: bool,
+}
+
+impl MeterReadings {
+    fn silent(n: usize) -> Self {
+        Self {
+            levels: vec![Level::default(); n],
+            has_rms: false,
+        }
+    }
+
+    /// One draining read from a real backend: `levels()` when it measures
+    /// RMS, otherwise `meters()` as peak-only. Never both, since
+    /// whichever runs first empties the accumulator.
+    fn drain<D: RmeDevice>(d: &D, n: usize) -> Self {
+        if let Some(levels) = d.levels() {
+            return Self {
+                levels,
+                has_rms: true,
+            };
+        }
+        match d.meters() {
+            Some(peaks) => Self {
+                levels: peaks.into_iter().map(Level::peak_only).collect(),
+                has_rms: false,
+            },
+            None => Self::silent(n),
+        }
+    }
+
+    fn get(&self, i: usize) -> Level {
+        self.levels.get(i).copied().unwrap_or_default()
+    }
+}
+
+/// The actual math behind `DeviceHandle::output_levels` — each output
 /// *channel*'s level is the power sum of every input/playback source
 /// routed into it, scaled by that source's live meter reading. Pulled
 /// out as a free, pure function (rather than left inline) so it's
@@ -704,6 +788,8 @@ pub enum Message {
     /// them. Distinct from the M/S/F row, which isn't wired to
     /// `on_press` at all (see `sidebar::msf_row`).
     ToggleSkeletonPair(sidebar::SkeletonPair),
+    /// Options → meters → "RMS +3 dB".
+    ToggleRmsPlus3,
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
     /// will save into.
     SnapshotClicked(u8),
@@ -876,6 +962,9 @@ pub struct TuxMix {
     /// an expanded sidebar. `false` reclaims its width for the mixer,
     /// leaving only a thin rail with the button to bring it back.
     pub sidebar_open: bool,
+    /// Options → meters → "RMS +3 dB". Not saved yet; the Level Meters
+    /// preferences will hold it.
+    pub rms_plus3: bool,
 }
 
 /// Matches the "Max lines" default in oscmix's own OSC debug log — enough
@@ -916,7 +1005,22 @@ pub struct MeterAnim {
     /// the release ease-out curve. Clamped at `METER_RELEASE_MS`, meaning
     /// "fully settled into the tail rate".
     release_elapsed_ms: f32,
+    /// RMS, smoothed on its own slower time constant.
+    prev_rms: f32,
+    rms: f32,
+    /// Whether the last reading carried RMS. When it did not, the frame
+    /// reports no RMS and the meter draws the peak as its fill.
+    has_rms: bool,
 }
+
+/// Time constant of the RMS display. RMS is meant to show average
+/// loudness, so it moves much more slowly than peak, the same in both
+/// directions.
+const METER_RMS_TAU_MS: f32 = 300.0;
+
+/// "RMS +3 dB": lifts RMS by 3 dB so a full-scale sine reads 0 dBFS on
+/// both RMS and peak, as TotalMix offers. 10^(3/20).
+const RMS_PLUS3_GAIN: f32 = 1.412_537_5;
 
 impl MeterAnim {
     fn new() -> Self {
@@ -925,6 +1029,9 @@ impl MeterAnim {
             value: 0.0,
             last_step_at: Instant::now(),
             release_elapsed_ms: METER_RELEASE_MS,
+            prev_rms: 0.0,
+            rms: 0.0,
+            has_rms: false,
         }
     }
 
@@ -933,10 +1040,30 @@ impl MeterAnim {
             prev: self.prev_value,
             value: self.value,
             since: self.last_step_at,
+            rms: self.has_rms.then_some(fader::RmsFrame {
+                prev: self.prev_rms,
+                value: self.rms,
+            }),
         }
     }
 
-    fn step(&mut self, target: f32) {
+    /// Advance one tick. `rms_gain` is 1.0, or `RMS_PLUS3_GAIN` with the
+    /// +3 dB option on.
+    fn step(&mut self, level: Level, has_rms: bool, rms_gain: f32) {
+        self.step_peak(level.peak);
+        self.prev_rms = self.rms;
+        if has_rms {
+            let target = (level.rms * rms_gain).clamp(0.0, 1.0);
+            let alpha = 1.0 - (-METER_TICK_MS / METER_RMS_TAU_MS).exp();
+            self.rms += (target - self.rms) * alpha;
+        } else {
+            self.rms = 0.0;
+            self.prev_rms = 0.0;
+        }
+        self.has_rms = has_rms;
+    }
+
+    fn step_peak(&mut self, target: f32) {
         self.prev_value = self.value;
         if target >= self.value {
             self.value += (target - self.value) * METER_ATTACK;
@@ -1023,6 +1150,7 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         sidebar_panels_open: sidebar::PanelsOpen::default(),
         skeleton_pairs: sidebar::SkeletonPairs::default(),
         sidebar_open: true,
+        rms_plus3: false,
     }
 }
 
@@ -1367,6 +1495,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::ToggleSidebarPanel(_)
             | Message::ToggleSidebar
             | Message::ToggleSkeletonPair(_)
+            | Message::ToggleRmsPlus3
             | Message::SnapshotStore
             | Message::GroupEditToggle
             | Message::GroupLinkToggle(..)
@@ -1411,17 +1540,18 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     state.sel_out = out;
                 }
             }
-            let in_levels = state.device.input_meters();
-            for (i, m) in state.input_meters.iter_mut().enumerate() {
-                m.step(in_levels.get(i).copied().unwrap_or(0.0));
-            }
-            let pb_levels = state.device.playback_meters();
-            for (i, m) in state.playback_meters.iter_mut().enumerate() {
-                m.step(pb_levels.get(i).copied().unwrap_or(0.0));
-            }
-            let out_levels = state.device.output_meters();
-            for (i, m) in state.output_meters.iter_mut().enumerate() {
-                m.step(out_levels.get(i).copied().unwrap_or(0.0));
+            let in_levels = state.device.input_levels();
+            let pb_levels = state.device.playback_levels();
+            let out_levels = state.device.output_levels(&in_levels, &pb_levels);
+            let rms_gain = if state.rms_plus3 { RMS_PLUS3_GAIN } else { 1.0 };
+            for (anims, readings) in [
+                (&mut state.input_meters, &in_levels),
+                (&mut state.playback_meters, &pb_levels),
+                (&mut state.output_meters, &out_levels),
+            ] {
+                for (i, m) in anims.iter_mut().enumerate() {
+                    m.step(readings.get(i), readings.has_rms, rms_gain);
+                }
             }
             // Persist the mixer state (debounced 3 s) — no hardware
             // readback for gains/volumes, so this is the restore source
@@ -1884,6 +2014,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ToggleSidebarPanel(panel) => state.sidebar_panels_open.toggle(panel),
         Message::ToggleSidebar => state.sidebar_open = !state.sidebar_open,
         Message::ToggleSkeletonPair(pair) => state.skeleton_pairs.toggle(pair),
+        Message::ToggleRmsPlus3 => state.rms_plus3 = !state.rms_plus3,
         Message::SnapshotClicked(n) => {
             state.active_snapshot = Some(n as usize);
             if let Some(scene) = load_scene_file(&format!("Mix {n}")) {
@@ -3467,11 +3598,12 @@ mod tests {
     use super::{
         all_channel_ids, all_channels_muted, any_channel_soloed, apply_pending_resize,
         channel_is_muted, channel_is_soloed, new, power_sum_output_meters, update, zoom,
-        ChannelId, MeterAnim, Message, ZOOM_STEP,
+        ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, RMS_PLUS3_GAIN, ZOOM_STEP,
     };
     use crate::sidebar;
     use crate::widgets::strip;
     use std::collections::HashSet;
+    use tuxmix_core::Level;
     use tuxmix_core::RmeDevice;
 
     #[test]
@@ -3510,6 +3642,105 @@ mod tests {
         for level in &out[2..] {
             assert_eq!(*level, 0.0);
         }
+    }
+
+    #[test]
+    fn meter_anim_reports_rms_only_when_measured() {
+        let level = Level {
+            peak: 0.8,
+            rms: 0.4,
+        };
+        let mut m = MeterAnim::new();
+        m.step(level, true, 1.0);
+        let f = m.frame();
+        let rms = f.rms.expect("RMS was measured");
+        assert!(rms.value > 0.0 && rms.value < 0.4, "RMS eases in: {rms:?}");
+
+        // The same backend going peak-only must stop drawing RMS rather
+        // than freeze the last bar.
+        m.step(Level::peak_only(0.8), false, 1.0);
+        assert!(m.frame().rms.is_none());
+    }
+
+    #[test]
+    fn meter_anim_rms_is_slower_than_peak() {
+        let mut m = MeterAnim::new();
+        m.step(
+            Level {
+                peak: 0.5,
+                rms: 0.5,
+            },
+            true,
+            1.0,
+        );
+        let f = m.frame();
+        assert!(f.rms.unwrap().value < f.value, "{f:?}");
+    }
+
+    #[test]
+    fn meter_anim_rms_settles_on_target_with_plus3() {
+        let mut m = MeterAnim::new();
+        let sine = Level {
+            peak: 1.0,
+            rms: std::f32::consts::FRAC_1_SQRT_2,
+        };
+        for _ in 0..200 {
+            m.step(sine, true, RMS_PLUS3_GAIN);
+        }
+        let rms = m.frame().rms.unwrap().value;
+        // +3 dB is 1.4125, not exactly sqrt(2) (3.01 dB), so the sine
+        // lands at 0.9988, about -0.01 dB.
+        assert!(
+            (rms - 1.0).abs() < 2e-3,
+            "a full-scale sine should read 0 dBFS RMS with +3 dB on, got {rms}"
+        );
+    }
+
+    #[test]
+    fn output_levels_uses_the_readings_it_is_given() {
+        // Regression: output meters used to read the inputs a second time
+        // in the same tick, which drains the real backends and returns
+        // zeros. Given readings are used as-is, so a fixed input shows up
+        // on every output the input is routed to.
+        let dev = DeviceHandle::open_mock();
+        let n_in = dev.inputs().len();
+        let routed: Vec<usize> = (0..dev.outputs().len())
+            .filter(|o| dev.inputs()[0].volumes.get(o / 2).copied().unwrap_or(0.0) > 0.0)
+            .collect();
+        let mut inputs = MeterReadings {
+            levels: vec![Level::default(); n_in],
+            has_rms: true,
+        };
+        inputs.levels[0] = Level {
+            peak: 0.5,
+            rms: 0.25,
+        };
+        let playbacks = MeterReadings {
+            levels: vec![Level::default(); dev.playbacks().len()],
+            has_rms: true,
+        };
+        let out = dev.output_levels(&inputs, &playbacks);
+        assert!(out.has_rms);
+        assert_eq!(out.levels.len(), dev.outputs().len());
+        for o in routed {
+            let v = dev.inputs()[0].volumes[o / 2];
+            assert!((out.levels[o].peak - (0.5 * v).min(1.0)).abs() < 1e-5);
+            assert!((out.levels[o].rms - (0.25 * v).min(1.0)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn output_levels_drop_rms_when_inputs_are_peak_only() {
+        let dev = DeviceHandle::open_mock();
+        let inputs = MeterReadings {
+            levels: vec![Level::peak_only(0.5); dev.inputs().len()],
+            has_rms: false,
+        };
+        let playbacks = MeterReadings {
+            levels: vec![Level::default(); dev.playbacks().len()],
+            has_rms: true,
+        };
+        assert!(!dev.output_levels(&inputs, &playbacks).has_rms);
     }
 
     #[test]
@@ -3553,7 +3784,7 @@ mod tests {
     #[test]
     fn attack_rises_fast() {
         let mut m = MeterAnim::new();
-        m.step(1.0);
+        m.step_peak(1.0);
         assert!(
             m.frame().value > 0.5,
             "one attack tick should jump most of the way: {}",
@@ -3564,17 +3795,17 @@ mod tests {
     #[test]
     fn release_decelerates_over_time() {
         let mut m = MeterAnim::new();
-        m.step(1.0); // reach a peak first
+        m.step_peak(1.0); // reach a peak first
         let peak = m.frame().value;
 
-        m.step(0.0);
+        m.step_peak(0.0);
         let drop_1 = peak - m.frame().value;
 
         for _ in 0..10 {
-            m.step(0.0);
+            m.step_peak(0.0);
         }
         let before_late = m.frame().value;
-        m.step(0.0);
+        m.step_peak(0.0);
         let drop_late = before_late - m.frame().value;
 
         assert!(
@@ -3586,10 +3817,10 @@ mod tests {
     #[test]
     fn rising_mid_release_cancels_it_and_resets_the_curve() {
         let mut m = MeterAnim::new();
-        m.step(1.0);
-        m.step(0.0);
-        m.step(0.0);
-        m.step(1.0); // new peak — release curve should restart from here
+        m.step_peak(1.0);
+        m.step_peak(0.0);
+        m.step_peak(0.0);
+        m.step_peak(1.0); // new peak — release curve should restart from here
         assert_eq!(m.release_elapsed_ms, 0.0);
     }
 

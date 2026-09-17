@@ -36,7 +36,7 @@ pub use babyface::BabyfacePro;
 pub use channel::{
     ChannelId, ChannelType, InputChannel, OutputChannel, PlaybackChannel, Sensitivity,
 };
-pub use device::{DeviceSettings, RmeDevice};
+pub use device::{DeviceSettings, Level, RmeDevice};
 pub use error::Error;
 #[cfg(feature = "alsa")]
 pub use mixer::AlsaMixer;
