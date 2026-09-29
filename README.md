@@ -51,6 +51,14 @@ Two ways to get sound from the Babyface Pro FS:
   the USB backend never had) — now ported from the USB backend's own
   hardware-validated crosspoint-zeroing behavior and hardware-validated
   in turn.
+- The ALSA backend follows the card (2026-09-29): changes made by the
+  front panel, `alsamixer`, `alsactl restore` or any other client show
+  up in the GUI within a tick (before that, the backend kept the values
+  it read at startup).  It also plays TotalMix's part for the DIM
+  button: the kernel driver only counts DIM presses (`DIM Button Press
+  Count`), and TuxMix toggles `Dim` on each one - so with the kernel
+  driver, the hardware DIM button works while TuxMix is running.
+  `cargo run --example panel-watch` prints what the backend sees.
 - See the sibling driver repo for the kernel-side status.
 
 ## Build

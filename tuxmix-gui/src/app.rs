@@ -461,7 +461,7 @@ impl DeviceHandle {
             DeviceHandle::Mock(_) => None,
             DeviceHandle::Usb(d) => Some(d.panel_selection()),
             #[cfg(feature = "alsa")]
-            DeviceHandle::Real(_) => None,
+            DeviceHandle::Real(d) => d.panel_selection(),
         }
     }
 }

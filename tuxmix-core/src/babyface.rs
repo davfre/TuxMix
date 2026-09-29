@@ -249,6 +249,53 @@ fn encode_volume_pan(volume: f32, pan: i8, max: f32) -> (i64, i64) {
     ((l * max) as i64, (r * max) as i64)
 }
 
+// ── Following the driver ───────────────────────────────────────
+//
+// The kernel driver changes controls on its own: the front-panel wheel
+// moves an output master, a preamp gain or a monitoring crosspoint, SET
+// toggles 48V, and `alsactl restore` or another mixer can write any of
+// them.  `poll_events` re-reads the model from the card whenever ALSA
+// reports a change, so the GUI shows what the hardware really holds.
+
+/// How long after the last ALSA event to read the card once more.  The
+/// driver notifies the front-panel controls on every wheel click, but not
+/// every control a click moves (a gain or a crosspoint), and the notify
+/// can come before the write it reports - one more read after the burst
+/// catches what the events themselves did not carry.
+const RESYNC_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Largest difference between the model and the card that still counts as
+/// "the same value": the model keeps the float the UI asked for, the card
+/// the integer it was rounded to, so a re-read must not nudge a fader the
+/// user is holding.  Below one step of the finest control (a crosspoint,
+/// full scale 0x2d41).
+const RESYNC_EPSILON: f32 = 1.0 / 8192.0;
+
+/// Whether a value read back from the card differs from the model by more
+/// than the rounding a write introduces.
+fn resync_differs(model: f32, card: f32) -> bool {
+    (model - card).abs() > RESYNC_EPSILON
+}
+
+/// The driver's "Front Panel In"/"Front Panel Out" enum item (0 = not
+/// known yet, 1..=3 = the three positions) as the 0-based selection the
+/// USB backend reports: IN 0 = Ch 1/2, 1 = Ch 3/4, 2 = Opt; OUT 0 = Ch
+/// 1/2, 1 = Phones, 2 = Opt.
+fn panel_enum_to_sel(item: u32) -> Option<usize> {
+    match item {
+        1..=3 => Some(item as usize - 1),
+        _ => None,
+    }
+}
+
+/// Whether the DIM presses counted between two reads of the driver's
+/// "DIM Button Press Count" leave DIM toggled: an odd number of presses
+/// does, an even one cancels out.  The count wraps at 2^31.
+fn dim_presses_toggle(prev: i64, now: i64) -> bool {
+    let delta = (now - prev).rem_euclid(1 << 31);
+    delta % 2 == 1
+}
+
 // ── Main struct ────────────────────────────────────────────────
 
 /// Babyface Pro (FS) device controller.
@@ -275,6 +322,19 @@ pub struct BabyfacePro {
     /// `capture_meter`'s own module doc comment for why this is scoped
     /// to just these two channels.
     capture_meter: Option<crate::capture_meter::CaptureMeter>,
+    /// The driver's "DIM Button Press Count" as last seen, `None` when the
+    /// control does not exist (an older driver that applied DIM itself,
+    /// or the class-compliant mode).  Since `babyface-pro-linux` 1597d28
+    /// the driver only counts presses; acting on them is the mixer
+    /// application's job, as it is TotalMix's on Windows.
+    dim_press_count: Option<i64>,
+    /// Front-panel state from the driver's "Front Panel *" controls:
+    /// (MIX engaged, IN selection, OUT selection), see
+    /// [`BabyfacePro::panel_selection`].
+    panel: Option<(bool, usize, usize)>,
+    /// When to re-read the card once more after a burst of ALSA events,
+    /// see [`RESYNC_SETTLE`].
+    resync_at: Option<std::time::Instant>,
 }
 
 impl BabyfacePro {
@@ -497,7 +557,15 @@ impl BabyfacePro {
     /// sentinel controls *before* getting here: absent the guard, a card
     /// with an entirely foreign control grammar (a CC-mode Babyface on
     /// `snd-usb-audio`) matches nothing at all and still looks healthy.
-    fn attach_mixer_elements(&mut self) {
+    ///
+    /// `resync` is set when re-reading a card already in use (see
+    /// `poll_events`).  Mute and solo on the input/playback strips exist
+    /// only here - they zero crosspoints on the card while the model keeps
+    /// the real levels to restore - so a re-read leaves the crosspoints of
+    /// a muted strip, and every strip's while one is soloed, alone.  So
+    /// does an output's master in the class-compliant grammar while it is
+    /// muted, which is model-level there too.
+    fn attach_mixer_elements(&mut self, resync: bool) {
         let mono = SelemChannelId::mono();
 
         for (name, selem) in self.mixer.iter_selems() {
@@ -669,14 +737,24 @@ impl BabyfacePro {
         }
 
         // ── Crosspoint volume (+ pan for the 4 true-mono sources) ──
+        let any_solo = self.inputs.iter().any(|c| c.solo) || self.playbacks.iter().any(|c| c.solo);
         for i in 0..self.inputs.len() {
             let Some((src, ch, is_mono)) = input_crosspoint_slot(i) else {
                 continue;
             };
+            if resync && (self.inputs[i].mute || any_solo) {
+                continue;
+            }
             for out in 0..self.profile.output_pair_count() {
                 if let Some((volume, pan)) = self.read_crosspoint(src, ch, is_mono, out) {
+                    if resync && !resync_differs(self.inputs[i].volumes[out], volume) {
+                        continue;
+                    }
                     self.inputs[i].volumes[out] = volume;
-                    if is_mono {
+                    // A silent crosspoint carries no pan: keep the
+                    // model's, so a fader pulled down and back up does
+                    // not come back centred.
+                    if is_mono && (!resync || volume > 0.0) {
                         self.inputs[i].pans[out] = pan;
                     }
                 }
@@ -687,8 +765,14 @@ impl BabyfacePro {
             let Some((src, ch)) = playback_crosspoint_slot(i) else {
                 continue;
             };
+            if resync && (self.playbacks[i].mute || any_solo) {
+                continue;
+            }
             for out in 0..self.profile.output_pair_count() {
                 if let Some((volume, _)) = self.read_crosspoint(src, ch, false, out) {
+                    if resync && !resync_differs(self.playbacks[i].volumes[out], volume) {
+                        continue;
+                    }
                     self.playbacks[i].volumes[out] = volume;
                 }
             }
@@ -742,7 +826,11 @@ impl BabyfacePro {
                     (v as f32 / max, Some(muted))
                 };
                 if let Some(out) = self.outputs.get_mut(pair_idx * 2 + side) {
-                    out.volume = volume;
+                    // Class-compliant mute is the master driven to 0.
+                    let model_level_mute = muted.is_none() && out.mute;
+                    if !(resync && (model_level_mute || !resync_differs(out.volume, volume))) {
+                        out.volume = volume;
+                    }
                     if let Some(m) = muted {
                         out.mute = m;
                     }
@@ -867,12 +955,67 @@ impl BabyfacePro {
             }
         }
 
-        info!(
-            "Attached {} inputs, {} playbacks, clock: {}",
-            self.inputs.len(),
-            self.playbacks.len(),
-            self.settings.clock_source
-        );
+        self.read_panel();
+
+        if !resync {
+            info!(
+                "Attached {} inputs, {} playbacks, clock: {}",
+                self.inputs.len(),
+                self.playbacks.len(),
+                self.settings.clock_source
+            );
+        }
+    }
+
+    /// Read the driver's front-panel controls into `self.panel`, and act
+    /// on DIM presses counted since the last read.
+    fn read_panel(&mut self) {
+        let mono = SelemChannelId::mono();
+        if self.grammar != ControlGrammar::Proprietary {
+            return;
+        }
+        let enum_item = |name: &str| {
+            self.mixer
+                .find_selem(name, 0)
+                .and_then(|s| s.get_enum_item(mono).ok())
+        };
+        let (in_item, out_item) = (enum_item("Front Panel In"), enum_item("Front Panel Out"));
+        let mix = self
+            .mixer
+            .find_selem("Front Panel Mix", 0)
+            .and_then(|s| s.get_playback_switch(mono).ok())
+            .map(|v| v != 0);
+        self.panel = match (mix, in_item, out_item) {
+            (Some(mix), Some(i), Some(o)) => Some((
+                mix,
+                panel_enum_to_sel(i).unwrap_or(0),
+                panel_enum_to_sel(o).unwrap_or(0),
+            )),
+            _ => None,
+        };
+
+        let count = self
+            .mixer
+            .find_selem("DIM Button Press Count", 0)
+            .and_then(|s| s.get_playback_volume(mono).ok());
+        if let (Some(prev), Some(now)) = (self.dim_press_count, count) {
+            if dim_presses_toggle(prev, now) {
+                let on = !self.settings.dim;
+                if let Err(e) = self.set_dim(on) {
+                    log::warn!("front-panel DIM press: setting Dim failed: {e}");
+                }
+            }
+        }
+        self.dim_press_count = count;
+    }
+
+    /// The front-panel state the driver reports, for the UI to follow:
+    /// (MIX engaged, IN selection, OUT selection), in the USB backend's
+    /// convention (IN 0 = Ch 1/2, 1 = Ch 3/4, 2 = Opt; OUT 0 = Ch 1/2,
+    /// 1 = Phones, 2 = Opt).  `None` if the driver has no front-panel
+    /// controls, or the card is in class-compliant mode.
+    pub fn panel_selection(&self) -> Option<(bool, usize, usize)> {
+        self.panel
     }
 
     fn channel(&self, ch: ChannelId) -> Result<(&bool, &bool), Error> {
@@ -997,8 +1140,11 @@ impl RmeDevice for BabyfacePro {
                 input_pair_link: Vec::new(),
             },
             linked: true,
+            dim_press_count: None,
+            panel: None,
+            resync_at: None,
         };
-        device.attach_mixer_elements();
+        device.attach_mixer_elements(false);
         Ok(device)
     }
 
@@ -1890,7 +2036,14 @@ impl RmeDevice for BabyfacePro {
     }
 
     fn poll_events(&mut self) -> Result<(), Error> {
-        let _ = self.mixer.handle_events()?;
+        let now = std::time::Instant::now();
+        if self.mixer.handle_events()? > 0 {
+            self.attach_mixer_elements(true);
+            self.resync_at = Some(now + RESYNC_SETTLE);
+        } else if self.resync_at.is_some_and(|t| now >= t) {
+            self.resync_at = None;
+            self.attach_mixer_elements(true);
+        }
         Ok(())
     }
 
@@ -1918,6 +2071,40 @@ mod tests {
     use super::*;
 
     const TEST_MAX: f32 = 65536.0;
+
+    #[test]
+    fn dim_toggles_on_an_odd_number_of_presses_only() {
+        assert!(!dim_presses_toggle(5, 5));
+        assert!(dim_presses_toggle(5, 6));
+        assert!(!dim_presses_toggle(5, 7));
+        assert!(dim_presses_toggle(5, 8));
+    }
+
+    #[test]
+    fn dim_press_count_wraps_at_two_to_the_31() {
+        let top = (1i64 << 31) - 1;
+        // top -> 0 is one press, top -> 1 two.
+        assert!(dim_presses_toggle(top, 0));
+        assert!(!dim_presses_toggle(top, 1));
+    }
+
+    #[test]
+    fn panel_enum_maps_to_the_usb_backend_selection() {
+        assert_eq!(panel_enum_to_sel(0), None); // not known yet
+        assert_eq!(panel_enum_to_sel(1), Some(0)); // Ch 1/2
+        assert_eq!(panel_enum_to_sel(2), Some(1)); // Ch 3/4 / Phones
+        assert_eq!(panel_enum_to_sel(3), Some(2)); // Opt
+        assert_eq!(panel_enum_to_sel(4), None);
+    }
+
+    #[test]
+    fn resync_ignores_rounding_but_not_a_real_change() {
+        // A crosspoint step (full scale 0x2d41) is below the threshold...
+        assert!(!resync_differs(0.5, 0.5 + 1.0 / 11585.0));
+        // ...a wheel click (0.5 dB, about 6 %) is well above it.
+        assert!(resync_differs(0.5, 0.53));
+        assert!(resync_differs(0.0, 0.01));
+    }
 
     #[test]
     fn decode_center_pan_from_equal_raw_volumes() {

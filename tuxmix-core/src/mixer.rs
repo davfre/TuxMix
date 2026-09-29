@@ -103,9 +103,15 @@ impl AlsaMixer {
         elems
     }
 
-    /// Handle pending ALSA events.
+    /// Handle pending ALSA events: returns how many were processed.
+    ///
+    /// alsa-lib keeps the simple-mixer values it read at load time and
+    /// only refreshes them from the events it is given here, so until
+    /// this runs every `get_*` returns the value the control had when
+    /// the mixer was opened, whatever the driver or another client did
+    /// since.  Does not block when nothing is pending.
     pub fn handle_events(&self) -> Result<u32, Error> {
-        Ok(0)
+        Ok(self.mixer.handle_events()?)
     }
 
     /// Name of the ALSA card (e.g. "hw:0") — also lets a caller open a

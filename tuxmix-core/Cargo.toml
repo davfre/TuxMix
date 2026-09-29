@@ -24,3 +24,7 @@ usb = ["dep:tuxmix-usb", "tuxmix-usb/driver"]
 [[example]]
 name = "alsa-scan"
 required-features = ["alsa"]
+
+[[example]]
+name = "panel-watch"
+required-features = ["alsa"]
