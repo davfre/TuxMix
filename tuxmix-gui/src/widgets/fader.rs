@@ -192,16 +192,33 @@ const METER_FLOOR_DB: f32 = -60.0;
 /// a level a signal can reach there. Output meters are a host-side
 /// estimate of the card's own mix, which can exceed full scale, so they
 /// keep room above 0 to show it.
+///
+/// On a K-System scale (`k_ref_db`, the dBFS where the scale's 0 sits)
+/// the marks and the readout are relative to that reference, and the
+/// fill is green below it, yellow up to 4 dB above it and red beyond.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterScale {
     pub top_db: f32,
+    pub k_ref_db: Option<f32>,
 }
 
 impl MeterScale {
     /// Ends at 0 dBFS: inputs and playbacks.
-    pub const FULL_SCALE: Self = Self { top_db: 0.0 };
+    pub const FULL_SCALE: Self = Self {
+        top_db: 0.0,
+        k_ref_db: None,
+    };
     /// Six dB above full scale: the estimated output meters.
-    pub const WITH_HEADROOM: Self = Self { top_db: 6.0 };
+    pub const WITH_HEADROOM: Self = Self {
+        top_db: 6.0,
+        k_ref_db: None,
+    };
+
+    /// The same scale with K-System marks and colors, or plain dBFS for
+    /// `None`.
+    pub fn with_k(self, k_ref_db: Option<f32>) -> Self {
+        Self { k_ref_db, ..self }
+    }
 
     /// Fraction of the column height for a level in dB.
     pub(crate) fn t_of_db(&self, db: f32) -> f32 {
@@ -224,13 +241,52 @@ impl MeterScale {
         10f32.powf(self.top_db / 20.0)
     }
 
-    /// Ruler marks, in dBFS, top first.
-    fn ticks(&self) -> &'static [f32] {
-        if self.top_db > 0.0 {
-            &[6.0, 0.0, -6.0, -12.0, -20.0, -40.0, -60.0]
-        } else {
-            &[0.0, -6.0, -12.0, -20.0, -30.0, -40.0, -60.0]
+    /// Ruler marks, top first, as (position in dBFS, label). On a
+    /// K-scale the labels count from the scale's 0.
+    fn ticks(&self) -> Vec<(f32, String)> {
+        let label = |rel: f32| match rel {
+            r if r > 0.0 => format!("+{}", r.round() as i32),
+            r if r == 0.0 => "0".to_string(),
+            r => format!("{}", -(r.round() as i32)),
+        };
+        match self.k_ref_db {
+            None => {
+                let marks: &[f32] = if self.top_db > 0.0 {
+                    &[6.0, 0.0, -6.0, -12.0, -20.0, -40.0, -60.0]
+                } else {
+                    &[0.0, -6.0, -12.0, -20.0, -30.0, -40.0, -60.0]
+                };
+                marks.iter().map(|&db| (db, label(db))).collect()
+            }
+            Some(k) => {
+                let top_rel = self.top_db - k;
+                let mut marks = vec![top_rel];
+                marks.extend([4.0, 0.0, -10.0, -20.0, -30.0, -40.0]);
+                marks
+                    .into_iter()
+                    .filter(|&rel| rel <= top_rel && k + rel >= METER_FLOOR_DB)
+                    .filter(|&rel| rel == top_rel || top_rel - rel >= 4.0)
+                    .map(|rel| (k + rel, label(rel)))
+                    .collect()
+            }
         }
+    }
+
+    /// Fill color for a level: on a K-scale by zone around the scale's 0,
+    /// otherwise green tinting toward red near full scale.
+    fn color(&self, l: f32, alpha: f32) -> Color {
+        let Some(k) = self.k_ref_db else {
+            return level_color(l, alpha);
+        };
+        let rel = if l > 0.0 { 20.0 * l.log10() - k } else { f32::NEG_INFINITY };
+        let base = if rel < 0.0 {
+            theme::MGREEN
+        } else if rel < 4.0 {
+            theme::YSIM
+        } else {
+            theme::MRED
+        };
+        Color { a: alpha, ..base }
     }
 }
 
@@ -822,7 +878,7 @@ fn draw_meter_bar(
         let fill_pos = Point::new(r.x, fill_top);
         frame.fill(
             &Path::new(|b| b.rounded_rectangle(fill_pos, Size::new(fill_w, fill_h), radius.into())),
-            level_color(fill_l, FILL_ALPHA),
+            meter_scale.color(fill_l, FILL_ALPHA),
         );
     }
 
@@ -835,7 +891,7 @@ fn draw_meter_bar(
         frame.fill_rectangle(
             Point::new(r.x, y),
             Size::new(fill_w, line_h),
-            level_color(l, 1.0),
+            meter_scale.color(l, 1.0),
         );
     }
 
@@ -1008,7 +1064,7 @@ fn draw_ruler(frame: &mut Frame, r: Rectangle, meter_scale: MeterScale, scale: f
     let tick_x0 = r.x;
     let tick_x1 = tick_x0 + 3.0 * scale;
     let label_x = r.x + r.width / 2.0;
-    for &db in meter_scale.ticks() {
+    for (db, label) in meter_scale.ticks() {
         let t = meter_scale.t_of_db(db);
         let y = r.y + r.height - r.height * t;
         let y = safe_clamp(y, r.y + 4.0 * scale, r.y + r.height - 4.0 * scale);
@@ -1019,13 +1075,6 @@ fn draw_ruler(frame: &mut Frame, r: Rectangle, meter_scale: MeterScale, scale: f
             Stroke::default().with_color(label_color).with_width(1.0),
         );
 
-        let label = if db > 0.0 {
-            format!("+{}", db as i32)
-        } else if db == 0.0 {
-            "0".to_string()
-        } else {
-            format!("{}", -db as i32)
-        };
         frame.fill_text(canvas::Text {
             content: label,
             position: Point::new(label_x, y - 4.0 * scale),
@@ -1162,6 +1211,25 @@ mod tests {
         assert!(s.t_of(0.5) < 1.0);
         assert_eq!(s.t_of(0.0), 0.0);
         assert_eq!(s.t_of_db(METER_FLOOR_DB), 0.0);
+    }
+
+    #[test]
+    fn k20_marks_count_from_minus_20_dbfs() {
+        let s = MeterScale::FULL_SCALE.with_k(Some(-20.0));
+        let ticks = s.ticks();
+        assert_eq!(ticks[0], (0.0, "+20".to_string()), "full scale is +20 on K-20");
+        assert!(ticks.contains(&(-20.0, "0".to_string())));
+        assert!(ticks.contains(&(-16.0, "+4".to_string())));
+        assert!(ticks.iter().all(|(db, _)| *db >= METER_FLOOR_DB));
+    }
+
+    #[test]
+    fn k_scale_colors_by_zone() {
+        let s = MeterScale::FULL_SCALE.with_k(Some(-20.0));
+        let db = |d: f32| 10f32.powf(d / 20.0);
+        assert_eq!(s.color(db(-25.0), 1.0), theme::MGREEN);
+        assert_eq!(s.color(db(-18.0), 1.0), theme::YSIM);
+        assert_eq!(s.color(db(-10.0), 1.0), theme::MRED);
     }
 
     #[test]

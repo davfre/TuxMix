@@ -159,12 +159,16 @@ impl MeterReadout {
     }
 }
 
-/// A held level as the readout shows it, in dBFS to one decimal.
-fn readout_text(l: f32) -> String {
+/// A held level as the readout shows it, to one decimal: dBFS, or on a
+/// K-scale (`k_ref_db`) relative to the scale's 0, signed.
+fn readout_text(l: f32, k_ref_db: Option<f32>) -> String {
     if l <= 1e-5 {
-        "-inf".into()
-    } else {
-        format!("{:.1}", 20.0 * l.log10())
+        return "-inf".into();
+    }
+    let db = 20.0 * l.log10();
+    match k_ref_db {
+        None => format!("{db:.1}"),
+        Some(k) => format!("{:+.1}", db - k),
     }
 }
 
@@ -670,7 +674,8 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // without a meter keeps the row's height so strips stay level.
     match p.readout {
         Some(r) => {
-            let peak = if r.over { "OVR".to_string() } else { readout_text(r.peak) };
+            let k = p.meter_scale.k_ref_db;
+            let peak = if r.over { "OVR".to_string() } else { readout_text(r.peak, k) };
             let mut readout_row = row![readout_box(
                 peak,
                 r.over,
@@ -683,7 +688,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             .width(Length::Fill);
             if let Some(rms) = r.rms {
                 readout_row = readout_row.push(readout_box(
-                    readout_text(rms),
+                    readout_text(rms, k),
                     false,
                     "Highest RMS, dBFS — click to reset",
                     cid,
@@ -1038,9 +1043,10 @@ mod tests {
 
     #[test]
     fn readout_text_is_dbfs_to_one_decimal() {
-        assert_eq!(readout_text(1.0), "0.0");
-        assert_eq!(readout_text(0.5), "-6.0");
-        assert_eq!(readout_text(0.0), "-inf");
+        assert_eq!(readout_text(1.0, None), "0.0");
+        assert_eq!(readout_text(0.5, None), "-6.0");
+        assert_eq!(readout_text(0.0, None), "-inf");
+        assert_eq!(readout_text(0.1, Some(-20.0)), "+0.0", "-20 dBFS is 0 on K-20");
     }
     use std::time::Duration;
 

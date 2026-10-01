@@ -16,6 +16,7 @@ use tuxmix_core::{
 };
 
 use crate::matrix;
+use crate::meter_settings::{KScale, MeterSettings, PeakHold};
 use crate::osc::{self, OscCommand, OscConfig, OscOutbound};
 use crate::scenes::{load_scene_file, save_scene_file};
 use crate::sidebar::{self, Group};
@@ -791,6 +792,8 @@ pub enum Message {
     ToggleSkeletonPair(sidebar::SkeletonPair),
     /// Options → meters → "RMS +3 dB".
     ToggleRmsPlus3,
+    SetKScale(KScale),
+    SetPeakHold(PeakHold),
     /// Click on a strip's readout box: clear its held peak, RMS and over.
     ResetMeterReadout(ChannelId),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
@@ -965,9 +968,8 @@ pub struct TuxMix {
     /// an expanded sidebar. `false` reclaims its width for the mixer,
     /// leaving only a thin rail with the button to bring it back.
     pub sidebar_open: bool,
-    /// Options → meters → "RMS +3 dB". Not saved yet; the Level Meters
-    /// preferences will hold it.
-    pub rms_plus3: bool,
+    /// Options → meters: RMS +3 dB, peak hold, K-scale. Saved on change.
+    pub meter_settings: MeterSettings,
 }
 
 /// Matches the "Max lines" default in oscmix's own OSC debug log — enough
@@ -1016,10 +1018,27 @@ pub struct MeterAnim {
     over: bool,
 }
 
-/// Time constant of the RMS display. RMS is meant to show average
-/// loudness, so it moves much more slowly than peak, the same in both
-/// directions.
-const METER_RMS_TAU_MS: f32 = 300.0;
+/// How a meter moves, from Options → meters: the RMS gain (1.0, or
+/// `RMS_PLUS3_GAIN` for AES17 RMS), the RMS time constant, and how long a
+/// new peak holds.
+#[derive(Clone, Copy, Debug)]
+pub struct Ballistics {
+    pub rms_gain: f32,
+    /// RMS is meant to show average loudness, so it moves much more
+    /// slowly than peak, the same in both directions.
+    pub rms_tau_ms: f32,
+    pub hold_ms: f32,
+}
+
+impl Default for Ballistics {
+    fn default() -> Self {
+        Self {
+            rms_gain: 1.0,
+            rms_tau_ms: 300.0,
+            hold_ms: PEAK_HOLD_MS,
+        }
+    }
+}
 
 /// "RMS +3 dB": lifts RMS by 3 dB so a full-scale sine reads 0 dBFS on
 /// both RMS and peak, as TotalMix offers. 10^(3/20).
@@ -1070,14 +1089,13 @@ impl MeterAnim {
         }
     }
 
-    /// Advance one tick. `rms_gain` is 1.0, or `RMS_PLUS3_GAIN` with the
-    /// +3 dB option on; `hold_ms` is how long a new peak holds.
-    fn step(&mut self, level: Level, has_rms: bool, rms_gain: f32, hold_ms: f32) {
-        self.step_peak(level.peak, hold_ms);
+    /// Advance one tick.
+    fn step(&mut self, level: Level, has_rms: bool, b: Ballistics) {
+        self.step_peak(level.peak, b.hold_ms);
         self.prev_rms = self.rms;
         if has_rms {
-            let target = (level.rms * rms_gain).clamp(0.0, 1.0);
-            let alpha = 1.0 - (-METER_TICK_MS / METER_RMS_TAU_MS).exp();
+            let target = (level.rms * b.rms_gain).clamp(0.0, 1.0);
+            let alpha = 1.0 - (-METER_TICK_MS / b.rms_tau_ms).exp();
             self.rms += (target - self.rms) * alpha;
         } else {
             self.rms = 0.0;
@@ -1182,7 +1200,7 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         sidebar_panels_open: sidebar::PanelsOpen::default(),
         skeleton_pairs: sidebar::SkeletonPairs::default(),
         sidebar_open: true,
-        rms_plus3: false,
+        meter_settings: MeterSettings::load(),
     }
 }
 
@@ -1528,6 +1546,8 @@ fn is_undoable(message: &Message) -> bool {
             | Message::ToggleSidebar
             | Message::ToggleSkeletonPair(_)
             | Message::ToggleRmsPlus3
+            | Message::SetKScale(_)
+            | Message::SetPeakHold(_)
             | Message::ResetMeterReadout(_)
             | Message::SnapshotStore
             | Message::GroupEditToggle
@@ -1576,14 +1596,19 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             let in_levels = state.device.input_levels();
             let pb_levels = state.device.playback_levels();
             let out_levels = state.device.output_levels(&in_levels, &pb_levels);
-            let rms_gain = if state.rms_plus3 { RMS_PLUS3_GAIN } else { 1.0 };
+            let settings = state.meter_settings;
+            let ballistics = Ballistics {
+                rms_gain: if settings.rms_aes17() { RMS_PLUS3_GAIN } else { 1.0 },
+                rms_tau_ms: settings.rms_tau_ms(),
+                hold_ms: settings.peak_hold_s * 1000.0,
+            };
             for (anims, readings) in [
                 (&mut state.input_meters, &in_levels),
                 (&mut state.playback_meters, &pb_levels),
                 (&mut state.output_meters, &out_levels),
             ] {
                 for (i, m) in anims.iter_mut().enumerate() {
-                    m.step(readings.get(i), readings.has_rms, rms_gain, PEAK_HOLD_MS);
+                    m.step(readings.get(i), readings.has_rms, ballistics);
                 }
             }
             // Persist the mixer state (debounced 3 s) — no hardware
@@ -2047,7 +2072,18 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ToggleSidebarPanel(panel) => state.sidebar_panels_open.toggle(panel),
         Message::ToggleSidebar => state.sidebar_open = !state.sidebar_open,
         Message::ToggleSkeletonPair(pair) => state.skeleton_pairs.toggle(pair),
-        Message::ToggleRmsPlus3 => state.rms_plus3 = !state.rms_plus3,
+        Message::ToggleRmsPlus3 => {
+            state.meter_settings.rms_plus3 = !state.meter_settings.rms_plus3;
+            save_meter_settings(state);
+        }
+        Message::SetKScale(k) => {
+            state.meter_settings.k_scale = k;
+            save_meter_settings(state);
+        }
+        Message::SetPeakHold(hold) => {
+            state.meter_settings.peak_hold_s = hold.0;
+            save_meter_settings(state);
+        }
         Message::ResetMeterReadout(cid) => {
             let (anims, idx, linked) = match cid {
                 ChannelId::Input(i) => (&mut state.input_meters, i, state.device.input_pair_linked(i / 2)),
@@ -2657,7 +2693,8 @@ fn strip_params<'a>(
         meter_available: false,
         meter2: None,
         meter2_available: false,
-        meter_scale: fader::MeterScale::FULL_SCALE,
+        meter_scale: fader::MeterScale::FULL_SCALE
+            .with_k(state.meter_settings.k_scale.reference_db()),
         readout: None,
         has_48v: false,
         has_pad: false,
@@ -2790,7 +2827,8 @@ fn strip_params<'a>(
                     .flatten(),
                 // The output meters estimate the card's own mix, which
                 // can pass full scale.
-                meter_scale: fader::MeterScale::WITH_HEADROOM,
+                meter_scale: fader::MeterScale::WITH_HEADROOM
+                    .with_k(state.meter_settings.k_scale.reference_db()),
                 loopback: ch.loopback,
                 stereo_linked: state.device.output_linked(i / 2),
                 mute: ch.mute,
@@ -2810,6 +2848,12 @@ fn reset_readouts(anims: &mut [MeterAnim], idx: usize, linked: bool) {
     let channels = if linked { idx & !1..(idx & !1) + 2 } else { idx..idx + 1 };
     for m in anims.iter_mut().take(channels.end).skip(channels.start) {
         m.reset_readout();
+    }
+}
+
+fn save_meter_settings(state: &mut TuxMix) {
+    if let Err(e) = state.meter_settings.save() {
+        log::warn!("saving the meter settings failed: {e}");
     }
 }
 
@@ -3694,7 +3738,7 @@ mod tests {
     use super::{
         all_channel_ids, all_channels_muted, any_channel_soloed, apply_pending_resize,
         channel_is_muted, channel_is_soloed, new, power_sum_output_meters, reset_readouts, update,
-        zoom, ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS,
+        zoom, Ballistics, ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS,
         PEAK_FALL_DB_PER_S, PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
     };
     use crate::sidebar;
@@ -3748,14 +3792,14 @@ mod tests {
             rms: 0.4,
         };
         let mut m = MeterAnim::new();
-        m.step(level, true, 1.0, PEAK_HOLD_MS);
+        m.step(level, true, Ballistics::default());
         let f = m.frame();
         let rms = f.rms.expect("RMS was measured");
         assert!(rms.value > 0.0 && rms.value < 0.4, "RMS eases in: {rms:?}");
 
         // The same backend going peak-only must stop drawing RMS rather
         // than freeze the last bar.
-        m.step(Level::peak_only(0.8), false, 1.0, PEAK_HOLD_MS);
+        m.step(Level::peak_only(0.8), false, Ballistics::default());
         assert!(m.frame().rms.is_none());
     }
 
@@ -3768,8 +3812,7 @@ mod tests {
                 rms: 0.5,
             },
             true,
-            1.0,
-            PEAK_HOLD_MS,
+            Ballistics::default(),
         );
         let f = m.frame();
         assert!(f.rms.unwrap().value < f.value, "{f:?}");
@@ -3783,7 +3826,7 @@ mod tests {
             rms: std::f32::consts::FRAC_1_SQRT_2,
         };
         for _ in 0..200 {
-            m.step(sine, true, RMS_PLUS3_GAIN, PEAK_HOLD_MS);
+            m.step(sine, true, Ballistics { rms_gain: RMS_PLUS3_GAIN, ..Ballistics::default() });
         }
         let rms = m.frame().rms.unwrap().value;
         // +3 dB is 1.4125, not exactly sqrt(2) (3.01 dB), so the sine
@@ -3882,14 +3925,14 @@ mod tests {
     #[test]
     fn readout_holds_the_highest_peak_and_latches_an_over() {
         let mut m = MeterAnim::new();
-        m.step(Level { peak: 0.5, rms: 0.2 }, true, 1.0, PEAK_HOLD_MS);
-        m.step(Level { peak: 0.1, rms: 0.1 }, true, 1.0, PEAK_HOLD_MS);
+        m.step(Level { peak: 0.5, rms: 0.2 }, true, Ballistics::default());
+        m.step(Level { peak: 0.1, rms: 0.1 }, true, Ballistics::default());
         let r = m.readout();
         assert_eq!(r.peak, 0.5);
         assert!(r.rms.is_some_and(|rms| rms > 0.0));
         assert!(!r.over);
-        m.step(Level { peak: 1.0, rms: 0.5 }, true, 1.0, PEAK_HOLD_MS);
-        m.step(Level { peak: 0.0, rms: 0.0 }, true, 1.0, PEAK_HOLD_MS);
+        m.step(Level { peak: 1.0, rms: 0.5 }, true, Ballistics::default());
+        m.step(Level { peak: 0.0, rms: 0.0 }, true, Ballistics::default());
         assert!(m.readout().over, "an over stays until reset");
     }
 
@@ -3898,7 +3941,7 @@ mod tests {
         let fresh = || {
             let mut anims = vec![MeterAnim::new(); 4];
             for m in anims.iter_mut() {
-                m.step(Level { peak: 1.0, rms: 0.5 }, true, 1.0, PEAK_HOLD_MS);
+                m.step(Level { peak: 1.0, rms: 0.5 }, true, Ballistics::default());
             }
             anims
         };

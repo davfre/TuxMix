@@ -8,12 +8,13 @@
 //! visual skeleton (per the user's own framing: build the shape, don't
 //! guess at behavior a static reference screenshot can't confirm).
 
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, pick_list, row, text};
 use iced::{Color, Element, Length};
 
 use tuxmix_core::{ChannelId, RmeDevice};
 
 use crate::app::{Message, TuxMix};
+use crate::meter_settings::{KScale, MeterSettings, PeakHold};
 use crate::theme;
 
 /// Fixed sidebar width (at `scale == 1.0`) — wide enough for the longest
@@ -358,24 +359,50 @@ fn segmented_row<'a>(
     .into()
 }
 
-/// The Options `meters` row: a dimmed, inert "post fx" cell beside an
-/// independent "RMS +3 dB" on/off button. Not a segmented pair: the two
-/// are separate settings, so turning one on must not light the other.
-fn meters_row(rms_plus3: bool, scale: f32) -> Element<'static, Message> {
+/// The Options `meters` rows: a dimmed, inert "post fx" cell beside an
+/// independent "RMS +3 dB" on/off button (not a segmented pair: the two
+/// are separate settings, so turning one on must not light the other),
+/// then the scale (dBFS or a K-System scale) and the peak hold time. A
+/// K-scale always uses AES17 RMS, so "RMS +3 dB" shows lit and inert then.
+fn meters_rows(settings: MeterSettings, scale: f32) -> Element<'static, Message> {
     let dim = Color {
         a: 0.4,
         ..theme::TEXT_SEC
     };
-    row![
-        button(text("post fx").size(theme::TEXT_XS * scale).color(dim))
-            .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+    let k_on = settings.k_scale != KScale::Off;
+    let mut plus3 = button(text("RMS +3 dB").size(theme::TEXT_XS * scale))
+        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+        .width(Length::Fill)
+        .style(theme::toggle_button(settings.rms_aes17(), theme::ACCENT));
+    if !k_on {
+        plus3 = plus3.on_press(Message::ToggleRmsPlus3);
+    }
+    column![
+        row![
+            button(text("post fx").size(theme::TEXT_XS * scale).color(dim))
+                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+                .width(Length::Fill)
+                .style(theme::plain_button),
+            plus3,
+        ]
+        .spacing(theme::SPACE_TIGHT * scale),
+        row![
+            pick_list(KScale::ALL, Some(settings.k_scale), Message::SetKScale)
+                .text_size(theme::TEXT_XS * scale)
+                .width(Length::Fill)
+                .style(theme::pick_list)
+                .menu_style(theme::menu),
+            pick_list(
+                PeakHold::CHOICES,
+                Some(PeakHold(settings.peak_hold_s)),
+                Message::SetPeakHold
+            )
+            .text_size(theme::TEXT_XS * scale)
             .width(Length::Fill)
-            .style(theme::plain_button),
-        button(text("RMS +3 dB").size(theme::TEXT_XS * scale))
-            .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
-            .width(Length::Fill)
-            .style(theme::toggle_button(rms_plus3, theme::ACCENT))
-            .on_press(Message::ToggleRmsPlus3),
+            .style(theme::pick_list)
+            .menu_style(theme::menu),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale),
     ]
     .spacing(theme::SPACE_TIGHT * scale)
     .into()
@@ -411,9 +438,8 @@ fn options_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
 
     col = col.push(label("meters"));
     // "post fx" stays disabled: there is no FX, so no post-FX tap point.
-    // "RMS +3 dB" is real: it lifts the RMS bar so a sine reads the same
-    // on RMS and peak.
-    col = col.push(meters_row(state.rms_plus3, scale));
+    // The rest is real and saved: RMS +3 dB, the scale, the peak hold.
+    col = col.push(meters_rows(state.meter_settings, scale));
 
     col = col.push(label("show"));
     col = col.push(segmented_row(

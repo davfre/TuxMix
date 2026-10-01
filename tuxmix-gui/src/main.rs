@@ -10,6 +10,7 @@
 mod app;
 mod layouts;
 mod matrix;
+mod meter_settings;
 mod osc;
 mod scenes;
 mod sidebar;
