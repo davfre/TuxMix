@@ -791,6 +791,8 @@ pub enum Message {
     ToggleSkeletonPair(sidebar::SkeletonPair),
     /// Options → meters → "RMS +3 dB".
     ToggleRmsPlus3,
+    /// Click on a strip's readout box: clear its held peak, RMS and over.
+    ResetMeterReadout(ChannelId),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
     /// will save into.
     SnapshotClicked(u8),
@@ -1007,6 +1009,11 @@ pub struct MeterAnim {
     /// Whether the last reading carried RMS. When it did not, the frame
     /// reports no RMS and the meter draws the peak as its fill.
     has_rms: bool,
+    /// The highest peak and displayed RMS since the readout was last
+    /// reset, and whether the signal reached full scale in that time.
+    max_peak: f32,
+    max_rms: f32,
+    over: bool,
 }
 
 /// Time constant of the RMS display. RMS is meant to show average
@@ -1028,7 +1035,27 @@ impl MeterAnim {
             prev_rms: 0.0,
             rms: 0.0,
             has_rms: false,
+            max_peak: 0.0,
+            max_rms: 0.0,
+            over: false,
         }
+    }
+
+    /// The strip's readout boxes: the highest peak and RMS since the last
+    /// reset, and whether an over was seen.
+    pub fn readout(&self) -> strip::MeterReadout {
+        strip::MeterReadout {
+            peak: self.max_peak,
+            rms: self.has_rms.then_some(self.max_rms),
+            over: self.over,
+        }
+    }
+
+    /// Clear the readout's held values (a click on a readout box).
+    fn reset_readout(&mut self) {
+        self.max_peak = 0.0;
+        self.max_rms = 0.0;
+        self.over = false;
     }
 
     pub fn frame(&self) -> fader::MeterFrame {
@@ -1057,6 +1084,13 @@ impl MeterAnim {
             self.prev_rms = 0.0;
         }
         self.has_rms = has_rms;
+        self.max_peak = self.max_peak.max(level.peak);
+        self.max_rms = self.max_rms.max(self.rms);
+        // Full scale is the largest value the stream can carry; an
+        // estimated output above it would clip on the card.
+        if level.peak >= 1.0 {
+            self.over = true;
+        }
     }
 
     /// A peak meter: a new maximum shows at once and holds for
@@ -1494,6 +1528,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::ToggleSidebar
             | Message::ToggleSkeletonPair(_)
             | Message::ToggleRmsPlus3
+            | Message::ResetMeterReadout(_)
             | Message::SnapshotStore
             | Message::GroupEditToggle
             | Message::GroupLinkToggle(..)
@@ -2013,6 +2048,14 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ToggleSidebar => state.sidebar_open = !state.sidebar_open,
         Message::ToggleSkeletonPair(pair) => state.skeleton_pairs.toggle(pair),
         Message::ToggleRmsPlus3 => state.rms_plus3 = !state.rms_plus3,
+        Message::ResetMeterReadout(cid) => {
+            let (anims, idx, linked) = match cid {
+                ChannelId::Input(i) => (&mut state.input_meters, i, state.device.input_pair_linked(i / 2)),
+                ChannelId::Playback(i) => (&mut state.playback_meters, i, state.device.playback_linked(i / 2)),
+                ChannelId::Output(i) => (&mut state.output_meters, i, state.device.output_linked(i / 2)),
+            };
+            reset_readouts(anims, idx, linked);
+        }
         Message::SnapshotClicked(n) => {
             state.active_snapshot = Some(n as usize);
             if let Some(scene) = load_scene_file(&format!("Mix {n}")) {
@@ -2615,6 +2658,7 @@ fn strip_params<'a>(
         meter2: None,
         meter2_available: false,
         meter_scale: fader::MeterScale::FULL_SCALE,
+        readout: None,
         has_48v: false,
         has_pad: false,
         phantom: false,
@@ -2670,6 +2714,11 @@ fn strip_params<'a>(
                     .map(MeterAnim::frame)
                     .unwrap_or_else(|| fader::MeterFrame::still(0.0)),
                 meter_available: state.device.has_input_meter(i),
+                readout: state
+                    .device
+                    .has_input_meter(i)
+                    .then(|| state.input_meters.get(i).map(MeterAnim::readout))
+                    .flatten(),
                 has_48v,
                 has_pad: has_48v,
                 phantom: ch.phantom,
@@ -2705,6 +2754,11 @@ fn strip_params<'a>(
                     .map(MeterAnim::frame)
                     .unwrap_or_else(|| fader::MeterFrame::still(0.0)),
                 meter_available: state.device.has_playback_meters(),
+                readout: state
+                    .device
+                    .has_playback_meters()
+                    .then(|| state.playback_meters.get(i).map(MeterAnim::readout))
+                    .flatten(),
                 has_split: true,
                 split: ch.split,
                 stereo_linked: state.device.playback_linked(i / 2),
@@ -2731,6 +2785,9 @@ fn strip_params<'a>(
                 // `DeviceHandle::output_meters`).
                 meter_available: state.device.has_input_meters()
                     || state.device.has_playback_meters(),
+                readout: (state.device.has_input_meters() || state.device.has_playback_meters())
+                    .then(|| state.output_meters.get(i).map(MeterAnim::readout))
+                    .flatten(),
                 // The output meters estimate the card's own mix, which
                 // can pass full scale.
                 meter_scale: fader::MeterScale::WITH_HEADROOM,
@@ -2744,6 +2801,28 @@ fn strip_params<'a>(
                 ..base
             }
         }
+    }
+}
+
+/// Reset the readout of the strip showing channel `idx`: both channels
+/// when it is a linked pair, which shows one readout for the two.
+fn reset_readouts(anims: &mut [MeterAnim], idx: usize, linked: bool) {
+    let channels = if linked { idx & !1..(idx & !1) + 2 } else { idx..idx + 1 };
+    for m in anims.iter_mut().take(channels.end).skip(channels.start) {
+        m.reset_readout();
+    }
+}
+
+/// A linked pair's combined strip shows the louder of its two readouts.
+fn merge_readout(
+    left: Option<strip::MeterReadout>,
+    right_available: bool,
+    right: Option<&MeterAnim>,
+) -> Option<strip::MeterReadout> {
+    let right = right.filter(|_| right_available).map(MeterAnim::readout);
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l.merge(r)),
+        (l, r) => l.or(r),
     }
 }
 
@@ -3311,6 +3390,11 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
                 // displayed at all while linked (found 2026-09-07).
                 params.meter2 = state.input_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available = state.device.has_input_meter(l + 1);
+                params.readout = merge_readout(
+                    params.readout,
+                    params.meter2_available,
+                    state.input_meters.get(l + 1),
+                );
             }
             let strip_widget = strip::strip(params);
             let mut item_width = rendered_strip_width(state, cid);
@@ -3391,6 +3475,11 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
                 }
                 params.meter2 = state.playback_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available = state.device.has_playback_meters();
+                params.readout = merge_readout(
+                    params.readout,
+                    params.meter2_available,
+                    state.playback_meters.get(l + 1),
+                );
             }
             let strip_widget = strip::strip(params);
             let mut item_width = rendered_strip_width(state, cid);
@@ -3441,6 +3530,11 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
                 params.meter2 = state.output_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available =
                     state.device.has_input_meters() || state.device.has_playback_meters();
+                params.readout = merge_readout(
+                    params.readout,
+                    params.meter2_available,
+                    state.output_meters.get(l + 1),
+                );
             }
             let strip_widget = strip::strip(params);
             let mut item_width = rendered_strip_width(state, cid);
@@ -3599,9 +3693,9 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
 mod tests {
     use super::{
         all_channel_ids, all_channels_muted, any_channel_soloed, apply_pending_resize,
-        channel_is_muted, channel_is_soloed, new, power_sum_output_meters, update, zoom,
-        ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS, PEAK_FALL_DB_PER_S,
-        PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
+        channel_is_muted, channel_is_soloed, new, power_sum_output_meters, reset_readouts, update,
+        zoom, ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS,
+        PEAK_FALL_DB_PER_S, PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
     };
     use crate::sidebar;
     use crate::widgets::strip;
@@ -3783,6 +3877,39 @@ mod tests {
         apply_pending_resize(&mut state);
         assert_eq!(state.ui_scale, before);
         assert_eq!(state.window_width, 700.0);
+    }
+
+    #[test]
+    fn readout_holds_the_highest_peak_and_latches_an_over() {
+        let mut m = MeterAnim::new();
+        m.step(Level { peak: 0.5, rms: 0.2 }, true, 1.0, PEAK_HOLD_MS);
+        m.step(Level { peak: 0.1, rms: 0.1 }, true, 1.0, PEAK_HOLD_MS);
+        let r = m.readout();
+        assert_eq!(r.peak, 0.5);
+        assert!(r.rms.is_some_and(|rms| rms > 0.0));
+        assert!(!r.over);
+        m.step(Level { peak: 1.0, rms: 0.5 }, true, 1.0, PEAK_HOLD_MS);
+        m.step(Level { peak: 0.0, rms: 0.0 }, true, 1.0, PEAK_HOLD_MS);
+        assert!(m.readout().over, "an over stays until reset");
+    }
+
+    #[test]
+    fn clicking_a_linked_pairs_readout_resets_both_channels() {
+        let fresh = || {
+            let mut anims = vec![MeterAnim::new(); 4];
+            for m in anims.iter_mut() {
+                m.step(Level { peak: 1.0, rms: 0.5 }, true, 1.0, PEAK_HOLD_MS);
+            }
+            anims
+        };
+        let mut anims = fresh();
+        reset_readouts(&mut anims, 1, true);
+        let peaks: Vec<f32> = anims.iter().map(|m| m.readout().peak).collect();
+        assert_eq!(peaks, vec![0.0, 0.0, 1.0, 1.0], "both sides of the pair, nothing else");
+        let mut anims = fresh();
+        reset_readouts(&mut anims, 1, false);
+        let peaks: Vec<f32> = anims.iter().map(|m| m.readout().peak).collect();
+        assert_eq!(peaks, vec![1.0, 0.0, 1.0, 1.0], "an unlinked strip is one channel");
     }
 
     #[test]

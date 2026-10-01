@@ -1,5 +1,5 @@
-//! A single channel strip: label + type tag, mute/solo, 48V/PAD, fader+VU,
-//! dB readout (double-click to edit), pan readout.
+//! A single channel strip: label + type tag, pan, held peak/RMS readout,
+//! fader+VU, dB readout (double-click to edit), mute/solo.
 
 use iced::advanced::text as advanced_text;
 use iced::keyboard::Modifiers;
@@ -37,7 +37,10 @@ pub(crate) const STRIP_W: f32 = 96.0;
 /// old flat offset existed to add. Empirically measured the same way the
 /// original number was (pixel-measuring a collapsed and an adjacent full
 /// strip side by side in a live screenshot), not derived on paper.
-const COLLAPSED_METER_H: f32 = FADER_H + 30.0;
+///
+/// Plus 19 for the held peak/RMS readout row the full strip gained above
+/// its meter (an 18px row and its hairline spacing).
+const COLLAPSED_METER_H: f32 = FADER_H + 49.0;
 /// Collapsed strips are a glance-only readout: name, Mute/Solo (kept
 /// live — see this function's own doc comment), and a VU meter; no
 /// fader, no pan, no route. Width is set by the header (name + expand
@@ -132,6 +135,67 @@ impl CollapseAnim {
     }
 }
 
+/// What a strip's readout boxes show: the highest peak and RMS since the
+/// last reset, in linear amplitude (1.0 = 0 dBFS), and whether an over
+/// was seen. `rms` is `None` on a backend that measures peaks only.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeterReadout {
+    pub peak: f32,
+    pub rms: Option<f32>,
+    pub over: bool,
+}
+
+impl MeterReadout {
+    /// The louder of two readouts, for a linked pair's combined strip.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            peak: self.peak.max(other.peak),
+            rms: match (self.rms, other.rms) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
+            over: self.over || other.over,
+        }
+    }
+}
+
+/// A held level as the readout shows it, in dBFS to one decimal.
+fn readout_text(l: f32) -> String {
+    if l <= 1e-5 {
+        "-inf".into()
+    } else {
+        format!("{:.1}", 20.0 * l.log10())
+    }
+}
+
+/// One readout box: a click resets the strip's held values.
+fn readout_box<'a>(
+    content: String,
+    over: bool,
+    tip: &'a str,
+    cid: ChannelId,
+    height: f32,
+    scale: f32,
+) -> Element<'a, Message> {
+    hint(
+        button(
+            container(
+                text(content)
+                    .size(theme::TEXT_XS * scale)
+                    .wrapping(advanced_text::Wrapping::None),
+            )
+            .center(Length::Fill),
+        )
+        .padding(0)
+        .width(Length::Fill)
+        .height(height)
+        .style(theme::readout_box(over))
+        .on_press(Message::ResetMeterReadout(cid)),
+        tip,
+        scale,
+    )
+}
+
 pub struct StripParams<'a> {
     pub cid: ChannelId,
     pub output_idx: usize,
@@ -152,6 +216,9 @@ pub struct StripParams<'a> {
     /// The meter's dB scale: full scale for inputs and playbacks, with
     /// headroom for the estimated output meters.
     pub meter_scale: MeterScale,
+    /// The held peak and RMS shown above the meter; `None` where the
+    /// meter has no real reading.
+    pub readout: Option<MeterReadout>,
     pub has_48v: bool,
     pub has_pad: bool,
     pub phantom: bool,
@@ -598,7 +665,36 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             .center_x(Length::Fill),
     );
 
-    rows = rows.push(ms_row);
+    // The held peak and RMS sit right above the meter, where a peak lands,
+    // with Mute/Solo/Cue moved below the fader as on a console. A strip
+    // without a meter keeps the row's height so strips stay level.
+    match p.readout {
+        Some(r) => {
+            let peak = if r.over { "OVR".to_string() } else { readout_text(r.peak) };
+            let mut readout_row = row![readout_box(
+                peak,
+                r.over,
+                "Highest peak, dBFS (OVR: full scale reached) — click to reset",
+                cid,
+                btn_h,
+                scale,
+            )]
+            .spacing(theme::SPACE_TIGHT)
+            .width(Length::Fill);
+            if let Some(rms) = r.rms {
+                readout_row = readout_row.push(readout_box(
+                    readout_text(rms),
+                    false,
+                    "Highest RMS, dBFS — click to reset",
+                    cid,
+                    btn_h,
+                    scale,
+                ));
+            }
+            rows = rows.push(readout_row);
+        }
+        None => rows = rows.push(iced::widget::Space::new().height(Length::Fixed(btn_h))),
+    }
     // 48V/PAD/Sensitivity/Gain all live in the gear flyout now (see
     // `app.rs::settings_popover`), not inline here — keeps every strip's
     // own height fixed regardless of channel type, and matches the route
@@ -823,6 +919,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         .align_y(iced::Alignment::Center)
         .width(Length::Fill),
     );
+    rows = rows.push(ms_row);
 
     // TotalMix-style per-strip route: a compact trigger, centered on the
     // strip, opening `app.rs::route_popover` — a flyout that slides out
@@ -929,6 +1026,22 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_readout_shows_the_louder_side() {
+        let l = MeterReadout { peak: 0.5, rms: Some(0.2), over: false };
+        let r = MeterReadout { peak: 0.25, rms: Some(0.3), over: true };
+        assert_eq!(l.merge(r), MeterReadout { peak: 0.5, rms: Some(0.3), over: true });
+        let peak_only = MeterReadout { peak: 0.1, rms: None, over: false };
+        assert_eq!(peak_only.merge(peak_only).rms, None);
+    }
+
+    #[test]
+    fn readout_text_is_dbfs_to_one_decimal() {
+        assert_eq!(readout_text(1.0), "0.0");
+        assert_eq!(readout_text(0.5), "-6.0");
+        assert_eq!(readout_text(0.0), "-inf");
+    }
     use std::time::Duration;
 
     #[test]

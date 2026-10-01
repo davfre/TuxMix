@@ -369,6 +369,29 @@ pub fn plain_button(_theme: &iced::Theme, status: button::Status) -> button::Sty
     }
 }
 
+/// A meter readout box under a strip's header: dark like the meter
+/// column, red text and border while an over is latched. Lighter on
+/// hover, since a click resets it.
+pub fn readout_box(over: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let bg = match status {
+            button::Status::Hovered | button::Status::Pressed => SURFACE,
+            _ => BG_DEEP,
+        };
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: if over { MRED } else { TEXT_PRIMARY },
+            border: Border {
+                color: if over { MRED } else { BORDER },
+                width: 1.0,
+                radius: RADIUS_XS.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        }
+    }
+}
+
 /// The small colored tick to the left of a section header label.
 pub fn accent_bar(_theme: &iced::Theme) -> container::Style {
     container::Style {
