@@ -719,6 +719,13 @@ pub trait RmeDevice {
     /// Apply a previously captured [`Scene`] to the hardware.
     fn apply_scene(&mut self, scene: &Scene) -> Result<(), Error>;
 
+    /// Whether the backend acts on front-panel DIM presses itself. The
+    /// ALSA backend toggles Dim on each press by default; an application
+    /// that assigns its own action to the button turns that off, so a
+    /// press is not handled twice. A no-op where the backend does not act
+    /// on DIM presses.
+    fn set_dim_press_toggle(&mut self, _on: bool) {}
+
     // ── Polling ─────────────────────────────────────────────────
 
     /// Process pending ALSA events (e.g. hardware state changes).

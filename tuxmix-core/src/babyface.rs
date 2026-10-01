@@ -328,6 +328,9 @@ pub struct BabyfacePro {
     /// the driver only counts presses; acting on them is the mixer
     /// application's job, as it is TotalMix's on Windows.
     dim_press_count: Option<i64>,
+    /// Toggle Dim on each DIM press (the default), unless the application
+    /// handles presses itself, see [`RmeDevice::set_dim_press_toggle`].
+    dim_press_toggles: bool,
     /// Front-panel state from the driver's "Front Panel *" controls:
     /// (MIX engaged, IN selection, OUT selection), see
     /// [`BabyfacePro::panel_selection`].
@@ -999,7 +1002,7 @@ impl BabyfacePro {
             .find_selem("DIM Button Press Count", 0)
             .and_then(|s| s.get_playback_volume(mono).ok());
         if let (Some(prev), Some(now)) = (self.dim_press_count, count) {
-            if dim_presses_toggle(prev, now) {
+            if self.dim_press_toggles && dim_presses_toggle(prev, now) {
                 let on = !self.settings.dim;
                 if let Err(e) = self.set_dim(on) {
                     log::warn!("front-panel DIM press: setting Dim failed: {e}");
@@ -1141,6 +1144,7 @@ impl RmeDevice for BabyfacePro {
             },
             linked: true,
             dim_press_count: None,
+            dim_press_toggles: true,
             panel: None,
             resync_at: None,
         };
@@ -2033,6 +2037,10 @@ impl RmeDevice for BabyfacePro {
             let _ = self.set_clock_source(&self.settings.clock_source.clone());
         }
         Ok(())
+    }
+
+    fn set_dim_press_toggle(&mut self, on: bool) {
+        self.dim_press_toggles = on;
     }
 
     fn poll_events(&mut self) -> Result<(), Error> {

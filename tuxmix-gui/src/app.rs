@@ -289,6 +289,10 @@ impl RmeDevice for DeviceHandle {
     fn apply_scene(&mut self, s: &Scene) -> Result<(), tuxmix_core::Error> {
         delegate!(self, apply_scene(s))
     }
+    fn set_dim_press_toggle(&mut self, on: bool) {
+        delegate!(self, set_dim_press_toggle(on))
+    }
+
     fn poll_events(&mut self) -> Result<(), tuxmix_core::Error> {
         delegate!(self, poll_events)
     }
