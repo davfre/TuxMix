@@ -63,6 +63,13 @@ pub(crate) const COLLAPSED_W: f32 = 44.0;
 const ICON_BTN_W: f32 = 15.0;
 const ICON_BTN_H: f32 = 14.0;
 
+/// The column of buttons beside the fader (T, Ø, SP, gear, EQ): bigger
+/// than `ICON_BTN_*`, with labels at the strip's text size, since at
+/// `TEXT_MICRO` the gear and Ø glyphs were too small to read. The fader
+/// row has the room: the column is shorter than the fader either way.
+const SIDE_BTN_W: f32 = 18.0;
+const SIDE_BTN_H: f32 = 17.0;
+
 /// Width (at `scale == 1.0`) of the Route flyout `app.rs` opens over a
 /// strip's right neighbor — `pub(crate)` because `app.rs` needs it to
 /// size the popover. Settings doesn't use this: it pushes the row instead
@@ -627,15 +634,15 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         show_meter: true,
         // The icon column (`icon_col`, built below) is this canvas's
         // `row!` sibling — same width regardless of how many buttons it
-        // holds (T/gear/EQ all share `ICON_BTN_W`), plus the row's own
+        // holds (T/gear/EQ all share `SIDE_BTN_W`), plus the row's own
         // spacing between them. See `Fader::reserved_right`'s own doc
         // comment for why the canvas needs to know this at all.
-        // `ICON_BTN_W` scales with the strip (every icon button's width
+        // `SIDE_BTN_W` scales with the strip (every icon button's width
         // does), but the row's own `.spacing(theme::SPACE_TIGHT)` below
         // — like several other spacings in this file — doesn't scale;
         // matching that exactly (not just approximately) is the point,
         // since this value feeds a pixel-level centering fix.
-        reserved_right: ICON_BTN_W * scale + theme::SPACE_TIGHT,
+        reserved_right: SIDE_BTN_W * scale + theme::SPACE_TIGHT,
         modifiers: p.modifiers,
         scale,
         show_track: true,
@@ -673,10 +680,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     if p.has_trim {
         let trim_open = p.open_flyout == Some(FlyoutKind::Trim);
         icon_col = icon_col.push(hint(
-            button(centered_label("T", theme::TEXT_MICRO * scale))
+            button(centered_label("T", theme::TEXT_SM * scale))
                 .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
+                .width(SIDE_BTN_W * scale)
+                .height(SIDE_BTN_H * scale)
                 // Lights up whenever trim is off unity too, not just
                 // while its flyout is open — same "shows live state at a
                 // glance" idea as the EQ trigger's own `eq_open ||
@@ -689,10 +696,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     }
     if p.has_phase {
         icon_col = icon_col.push(hint(
-            button(centered_label("Ø", theme::TEXT_MICRO * scale))
+            button(centered_label("Ø", theme::TEXT_SM * scale))
                 .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
+                .width(SIDE_BTN_W * scale)
+                .height(SIDE_BTN_H * scale)
                 .style(theme::toggle_button(p.phase, theme::ACCENT))
                 .on_press(Message::PhaseChanged(cid, !p.phase)),
             "Phase Ø invert",
@@ -701,10 +708,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     }
     if p.has_split {
         icon_col = icon_col.push(hint(
-            button(centered_label("SP", theme::TEXT_MICRO * scale))
+            button(centered_label("SP", theme::TEXT_SM * scale))
                 .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
+                .width(SIDE_BTN_W * scale)
+                .height(SIDE_BTN_H * scale)
                 .style(theme::toggle_button(p.split, theme::ACCENT))
                 .on_press(Message::StereoSplitChanged(cid, !p.split)),
             "Stereo split — hard-pan this pair into the AN1/2 monitor bus",
@@ -714,10 +721,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     if has_settings {
         let settings_open = p.open_flyout == Some(FlyoutKind::Settings);
         icon_col = icon_col.push(hint(
-            button(centered_label("⚙", theme::TEXT_MICRO * scale))
+            button(centered_label("⚙", theme::TEXT_SM * scale))
                 .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
+                .width(SIDE_BTN_W * scale)
+                .height(SIDE_BTN_H * scale)
                 .style(theme::toggle_button(settings_open, theme::ACCENT))
                 .on_press(Message::ToggleFlyout(cid, FlyoutKind::Settings)),
             if settings_open { "Hide settings" } else { "Show settings (48V/PAD/Sensitivity)" },
@@ -727,10 +734,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     if p.has_eq {
         let eq_open = p.open_flyout == Some(FlyoutKind::Eq);
         icon_col = icon_col.push(hint(
-            button(centered_label("EQ", theme::TEXT_MICRO * scale))
+            button(centered_label("EQ", theme::TEXT_SM * scale))
                 .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
+                .width(SIDE_BTN_W * scale)
+                .height(SIDE_BTN_H * scale)
                 .style(theme::toggle_button(eq_open || p.eq_enabled, theme::ACCENT))
                 .on_press(Message::ToggleFlyout(cid, FlyoutKind::Eq)),
             if eq_open { "Hide EQ" } else { "Show EQ (3-band + low cut)" },
