@@ -425,7 +425,8 @@ impl DeviceHandle {
     }
     /// Output meters, computed host-side like TotalMix: each output's
     /// level is the power sum of every routed source (inputs + playbacks)
-    /// scaled by that source's fader into the output. See
+    /// scaled by that source's fader into the output, then by the output's
+    /// own fader. See
     /// `power_sum_output_meters`'s own doc comment for the actual math —
     /// pulled out as a free function so it's testable with deterministic
     /// inputs, since the mock backend's own meter readings are randomized.
@@ -441,30 +442,58 @@ impl DeviceHandle {
         inputs: &MeterReadings,
         playbacks: &MeterReadings,
     ) -> MeterReadings {
-        let in_vols = self
+        let mut sources: Vec<MixSource> = self
             .inputs()
             .iter()
-            .map(|c| c.volumes.clone())
-            .collect::<Vec<_>>();
-        let pb_vols = self
-            .playbacks()
-            .iter()
-            .map(|c| c.volumes.clone())
-            .collect::<Vec<_>>();
+            .enumerate()
+            .map(|(i, c)| MixSource {
+                volumes: &c.volumes,
+                pans: &c.pans,
+                feeds: if matches!(c.channel_type, ChannelType::Mic | ChannelType::Instrument) {
+                    Feeds::Both
+                } else {
+                    Feeds::side_of(i)
+                },
+            })
+            .collect();
+        sources.extend(self.playbacks().iter().enumerate().map(|(i, c)| MixSource {
+            volumes: &c.volumes,
+            pans: &c.pans,
+            feeds: Feeds::side_of(i),
+        }));
         let n_out = self.outputs().len();
-        let peaks = |r: &MeterReadings| r.levels.iter().map(|l| l.peak).collect::<Vec<_>>();
-        let rmss = |r: &MeterReadings| r.levels.iter().map(|l| l.rms).collect::<Vec<_>>();
-        let peak =
-            power_sum_output_meters(&in_vols, &peaks(inputs), &pb_vols, &peaks(playbacks), n_out);
+        let levels = |f: fn(&Level) -> f32| {
+            inputs
+                .levels
+                .iter()
+                .chain(playbacks.levels.iter())
+                .map(f)
+                .collect::<Vec<_>>()
+        };
+        let peak = power_sum_output_meters(&sources, &levels(|l| l.peak), n_out);
         // A source without RMS would add nothing to the sum and make the
         // output read low, so outputs get RMS only when every source that
         // is really measured has it.
         let has_rms = inputs.has_rms && (playbacks.has_rms || !self.has_playback_meters());
         let rms = if has_rms {
-            power_sum_output_meters(&in_vols, &rmss(inputs), &pb_vols, &rmss(playbacks), n_out)
+            power_sum_output_meters(&sources, &levels(|l| l.rms), n_out)
         } else {
             vec![0.0; n_out]
         };
+        // After the output's own fader and mute: the level the converter
+        // gets, which is where an over would clip.
+        let master: Vec<f32> = self
+            .outputs()
+            .iter()
+            .map(|o| if o.mute { 0.0 } else { o.volume })
+            .collect();
+        let post = |v: Vec<f32>| -> Vec<f32> {
+            v.iter()
+                .enumerate()
+                .map(|(o, l)| l * master.get(o).copied().unwrap_or(1.0))
+                .collect()
+        };
+        let (peak, rms) = (post(peak), post(rms));
         MeterReadings {
             levels: peak
                 .into_iter()
@@ -552,49 +581,86 @@ impl MeterReadings {
     }
 }
 
-/// The actual math behind `DeviceHandle::output_levels` — each output
-/// *channel*'s level is the power sum of every input/playback source
-/// routed into it, scaled by that source's live meter reading. Pulled
-/// out as a free, pure function (rather than left inline) so it's
-/// testable with deterministic meter values — the mock backend's own
-/// `input_meter`/`playback_meter` are randomized, so a test going
-/// through `DeviceHandle` itself could never assert an exact number.
-///
-/// `input_volumes`/`playback_volumes` are indexed by *output pair*
-/// (`output_pair_count()` entries — one crosspoint per pair, not per
-/// individual physical channel) while `n_out` is the individual output
-/// *channel* count (2 per pair) — the pair a channel `o` belongs to is
-/// `o / 2`, the same convention `set_channel_volume` and friends use
-/// everywhere else. Indexing the volumes arrays with the raw channel
-/// index instead of `o / 2` used to silently read the *wrong* pair's
-/// crosspoint for every odd channel, and always read nothing at all
-/// for every channel whose pair index was past the volumes arrays'
-/// own (pair-counted) length — every output pair past the first three
-/// read a permanent, wrong zero level regardless of actual audio.
-fn power_sum_output_meters(
-    input_volumes: &[Vec<f32>],
-    input_meters: &[f32],
-    playback_volumes: &[Vec<f32>],
-    playback_meters: &[f32],
-    n_out: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; n_out];
-    for (o, slot) in out.iter_mut().enumerate() {
-        let pair = o / 2;
-        let mut p = 0.0f32;
-        for (i, vols) in input_volumes.iter().enumerate() {
-            let v = vols.get(pair).copied().unwrap_or(0.0);
-            let m = input_meters.get(i).copied().unwrap_or(0.0);
-            p += (m * v) * (m * v);
+/// Which side of an output pair a source feeds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Feeds {
+    /// A mono source (the Mic and Instrument inputs): both sides, split
+    /// by its pan with the backends' balance law.
+    Both,
+    /// One channel of a stereo pair source (AS, ADAT, a playback pair):
+    /// the even channel feeds the left output, the odd one the right.
+    Left,
+    Right,
+}
+
+impl Feeds {
+    fn side_of(channel: usize) -> Self {
+        if channel % 2 == 0 {
+            Feeds::Left
+        } else {
+            Feeds::Right
         }
-        for (c, vols) in playback_volumes.iter().enumerate() {
-            let v = vols.get(pair).copied().unwrap_or(0.0);
-            let m = playback_meters.get(c).copied().unwrap_or(0.0);
-            p += (m * v) * (m * v);
-        }
-        *slot = p.sqrt().min(1.0);
     }
-    out
+
+    /// The crosspoint gain into one side (0 = left) of a pair, for a
+    /// source at `volume` and `pan` (-100..100) into that pair.
+    fn gain(self, volume: f32, pan: i8, side: usize) -> f32 {
+        match (self, side) {
+            (Feeds::Both, _) => {
+                let p = f32::from(pan.clamp(-100, 100)) / 100.0;
+                if side == 0 {
+                    volume * (1.0 - p.max(0.0))
+                } else {
+                    volume * (1.0 + p.min(0.0))
+                }
+            }
+            (Feeds::Left, 0) | (Feeds::Right, 1) => volume,
+            _ => 0.0,
+        }
+    }
+}
+
+/// One source in the output estimate: its crosspoint volume and pan per
+/// output pair, and which side of a pair it feeds.
+struct MixSource<'a> {
+    volumes: &'a [f32],
+    pans: &'a [i8],
+    feeds: Feeds,
+}
+
+/// The actual math behind `DeviceHandle::output_levels` — each output
+/// *channel*'s level is the power sum of every source routed into it,
+/// scaled by that source's crosspoint gain into that side. Pulled out as
+/// a free, pure function so it's testable with deterministic levels —
+/// the mock backend's own meters are randomized.
+///
+/// Volumes and pans are indexed by *output pair* while `n_out` counts
+/// individual output *channels* (2 per pair): channel `o` is side `o % 2`
+/// of pair `o / 2`, the convention `set_channel_volume` and friends use
+/// everywhere else. A pair past a source's own volumes array reads
+/// silent rather than panicking.
+///
+/// The result is not capped at full scale: the card's own mix can pass it
+/// and clip, and the output meter is the only place that would show.
+/// Being a power sum, it is right for uncorrelated sources and reads low
+/// for correlated ones (two identical signals sum 6 dB hotter, not 3).
+fn power_sum_output_meters(sources: &[MixSource], levels: &[f32], n_out: usize) -> Vec<f32> {
+    (0..n_out)
+        .map(|o| {
+            let (pair, side) = (o / 2, o % 2);
+            sources
+                .iter()
+                .zip(levels)
+                .map(|(s, &level)| {
+                    let volume = s.volumes.get(pair).copied().unwrap_or(0.0);
+                    let pan = s.pans.get(pair).copied().unwrap_or(0);
+                    let g = level * s.feeds.gain(volume, pan, side);
+                    g * g
+                })
+                .sum::<f32>()
+                .sqrt()
+        })
+        .collect()
 }
 
 /// Which top-level page is showing. `Quick` is the default — a focused
@@ -1094,7 +1160,8 @@ impl MeterAnim {
         self.step_peak(level.peak, b.hold_ms);
         self.prev_rms = self.rms;
         if has_rms {
-            let target = (level.rms * b.rms_gain).clamp(0.0, 1.0);
+            // Not capped at full scale: an estimated output mix can pass it.
+            let target = (level.rms * b.rms_gain).max(0.0);
             let alpha = 1.0 - (-METER_TICK_MS / b.rms_tau_ms).exp();
             self.rms += (target - self.rms) * alpha;
         } else {
@@ -3738,8 +3805,8 @@ mod tests {
     use super::{
         all_channel_ids, all_channels_muted, any_channel_soloed, apply_pending_resize,
         channel_is_muted, channel_is_soloed, new, power_sum_output_meters, reset_readouts, update,
-        zoom, Ballistics, ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS,
-        PEAK_FALL_DB_PER_S, PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
+        zoom, Ballistics, ChannelId, DeviceHandle, Feeds, MeterAnim, MeterReadings, Message,
+        MixSource, METER_TICK_MS, PEAK_FALL_DB_PER_S, PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
     };
     use crate::sidebar;
     use crate::widgets::strip;
@@ -3747,42 +3814,63 @@ mod tests {
     use tuxmix_core::Level;
     use tuxmix_core::RmeDevice;
 
+    fn mono(volumes: &[f32], pans: &[i8]) -> (Vec<f32>, Vec<i8>) {
+        (volumes.to_vec(), pans.to_vec())
+    }
+
     #[test]
     fn output_meters_reads_the_right_pair_for_every_individual_channel() {
-        // 3 output pairs (6 individual channels): pair 0 = ch0/1, pair 1
-        // = ch2/3, pair 2 = ch4/5. One input, routed at full volume into
-        // pair 2 only (and silent into pairs 0/1), reading a fixed 1.0
-        // meter level — deterministic, unlike the mock backend's own
-        // randomized meters.
-        let input_volumes = vec![vec![0.0, 0.0, 1.0]];
-        let input_meters = vec![1.0];
-        let out = power_sum_output_meters(&input_volumes, &input_meters, &[], &[], 6);
+        // 3 output pairs (6 channels). One centred mono input at full
+        // volume into pair 2 only, at a fixed full-scale level.
+        let (v, p) = mono(&[0.0, 0.0, 1.0], &[0, 0, 0]);
+        let sources = [MixSource { volumes: &v, pans: &p, feeds: Feeds::Both }];
+        let out = power_sum_output_meters(&sources, &[1.0], 6);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
+    }
 
-        assert_eq!(out.len(), 6);
-        assert_eq!(out[0], 0.0, "pair 0 (ch0) has no signal routed to it");
-        assert_eq!(out[1], 0.0, "pair 0 (ch1) has no signal routed to it");
-        assert_eq!(out[2], 0.0, "pair 1 (ch2) has no signal routed to it");
-        assert_eq!(out[3], 0.0, "pair 1 (ch3) has no signal routed to it");
-        assert_eq!(out[4], 1.0, "pair 2 (ch4) should read the full routed signal");
-        assert_eq!(out[5], 1.0, "pair 2 (ch5) should read the full routed signal");
+    #[test]
+    fn a_stereo_source_feeds_only_its_own_side() {
+        // A playback pair at full scale into pair 0: each side gets one
+        // channel, not both, so neither side reads over full scale.
+        let (v, p) = mono(&[1.0], &[0]);
+        let sources = [
+            MixSource { volumes: &v, pans: &p, feeds: Feeds::side_of(0) },
+            MixSource { volumes: &v, pans: &p, feeds: Feeds::side_of(1) },
+        ];
+        let out = power_sum_output_meters(&sources, &[1.0, 0.5], 2);
+        assert_eq!(out, vec![1.0, 0.5]);
+    }
+
+    #[test]
+    fn a_panned_mono_source_follows_the_balance_law() {
+        let (v, p) = mono(&[1.0], &[-50]);
+        let sources = [MixSource { volumes: &v, pans: &p, feeds: Feeds::Both }];
+        let out = power_sum_output_meters(&sources, &[1.0], 2);
+        assert_eq!(out, vec![1.0, 0.5]);
+    }
+
+    #[test]
+    fn output_estimate_can_pass_full_scale() {
+        // Two full-scale centred mono inputs into the same pair sum to +3 dB.
+        let (v, p) = mono(&[1.0], &[0]);
+        let sources = [
+            MixSource { volumes: &v, pans: &p, feeds: Feeds::Both },
+            MixSource { volumes: &v, pans: &p, feeds: Feeds::Both },
+        ];
+        let out = power_sum_output_meters(&sources, &[1.0, 1.0], 2);
+        assert!((out[0] - std::f32::consts::SQRT_2).abs() < 1e-5, "{out:?}");
     }
 
     #[test]
     fn output_meters_never_goes_out_of_bounds_for_pairs_past_the_volumes_array() {
-        // A device with more output *pairs* than any single source's
-        // `volumes` array happens to have entries for (shouldn't happen
-        // in practice, but the old bug's failure mode was exactly an
-        // out-of-bounds pair read silently going to 0.0 instead of
-        // panicking) — must stay silent-zero, not panic.
-        let input_volumes = vec![vec![1.0]]; // only 1 pair's worth of data
-        let input_meters = vec![1.0];
-        let out = power_sum_output_meters(&input_volumes, &input_meters, &[], &[], 12);
+        // More output pairs than the source's volumes array covers must
+        // read silent, not panic.
+        let (v, p) = mono(&[1.0], &[0]);
+        let sources = [MixSource { volumes: &v, pans: &p, feeds: Feeds::Both }];
+        let out = power_sum_output_meters(&sources, &[1.0], 12);
         assert_eq!(out.len(), 12);
-        assert_eq!(out[0], 1.0);
-        assert_eq!(out[1], 1.0);
-        for level in &out[2..] {
-            assert_eq!(*level, 0.0);
-        }
+        assert_eq!(&out[..2], &[1.0, 1.0]);
+        assert!(out[2..].iter().all(|&l| l == 0.0));
     }
 
     #[test]

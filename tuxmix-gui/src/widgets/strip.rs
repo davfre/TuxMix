@@ -676,10 +676,24 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         Some(r) => {
             let k = p.meter_scale.k_ref_db;
             let peak = if r.over { "OVR".to_string() } else { readout_text(r.peak, k) };
+            // Output levels are estimated from the routed sources: the card
+            // does not report its own mix.
+            let estimated = matches!(cid, ChannelId::Output(_));
+            let (peak_tip, rms_tip) = if estimated {
+                (
+                    "Highest peak, estimated from the routed sources (OVR: the mix would clip) — click to reset",
+                    "Highest RMS, estimated from the routed sources — click to reset",
+                )
+            } else {
+                (
+                    "Highest peak, dBFS (OVR: full scale reached) — click to reset",
+                    "Highest RMS, dBFS — click to reset",
+                )
+            };
             let mut readout_row = row![readout_box(
                 peak,
                 r.over,
-                "Highest peak, dBFS (OVR: full scale reached) — click to reset",
+                peak_tip,
                 cid,
                 btn_h,
                 scale,
@@ -690,7 +704,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                 readout_row = readout_row.push(readout_box(
                     readout_text(rms, k),
                     false,
-                    "Highest RMS, dBFS — click to reset",
+                    rms_tip,
                     cid,
                     btn_h,
                     scale,
