@@ -523,6 +523,68 @@ pub enum View {
     Matrix,
 }
 
+impl View {
+    fn name(self) -> &'static str {
+        match self {
+            View::Quick => "Quick",
+            View::Mixer => "Mixer",
+            View::Matrix => "Matrix",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [View::Quick, View::Mixer, View::Matrix]
+            .into_iter()
+            .find(|v| v.name() == name.trim())
+    }
+
+    /// Where the last view is kept: a one-word text file next to the
+    /// scenes directory, like the layouts.
+    fn file() -> std::path::PathBuf {
+        let dir = crate::scenes::scenes_dir()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("view")
+    }
+
+    /// The view TuxMix was left in, so it opens there again; `Quick`
+    /// the first time.
+    fn load_last() -> Self {
+        std::fs::read_to_string(Self::file())
+            .ok()
+            .and_then(|s| Self::from_name(&s))
+            .unwrap_or(View::Quick)
+    }
+
+    fn save_last(self) {
+        if let Err(e) = std::fs::write(Self::file(), self.name()) {
+            log::warn!("saving the current view failed: {e}");
+        }
+    }
+}
+
+/// Switch the page and remember it for the next start.
+fn set_view(state: &mut TuxMix, view: View) {
+    state.view = view;
+    view.save_last();
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::View;
+
+    #[test]
+    fn view_names_round_trip() {
+        for v in [View::Quick, View::Mixer, View::Matrix] {
+            assert_eq!(View::from_name(v.name()), Some(v));
+        }
+        assert_eq!(View::from_name("Mixer\n"), Some(View::Mixer));
+        assert_eq!(View::from_name("Desk"), None);
+    }
+}
+
 // ── Messages ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -981,7 +1043,7 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         device,
         sel_out: 0,
         last_panel_out: None,
-        view: View::Quick,
+        view: View::load_last(),
         quick_channel: ChannelId::Input(0),
         editing: None,
         edit_buf: String::new(),
@@ -1476,13 +1538,14 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             // Cycles all three views — previously skipped Quick (Matrix and
             // Mixer only), which read as broken since the tab bar itself
             // shows three tabs, not two.
-            state.view = match state.view {
+            let next = match state.view {
                 View::Quick => View::Mixer,
                 View::Mixer => View::Matrix,
                 View::Matrix => View::Quick,
             };
+            set_view(state, next);
         }
-        Message::SetView(v) => state.view = v,
+        Message::SetView(v) => set_view(state, v),
         Message::WheelZoom(y) => {
             // Only zoom on Ctrl+wheel; plain wheel keeps scrolling the
             // hovered scrollable (which iced handles on its own).
