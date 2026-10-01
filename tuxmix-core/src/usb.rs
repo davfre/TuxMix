@@ -1345,6 +1345,7 @@ impl RmeDevice for BabyfaceProUsb {
                 .map(|l| Level {
                     peak: l.peak,
                     rms: l.rms,
+                    overs: None,
                 })
                 .collect()
         })

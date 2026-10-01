@@ -145,6 +145,10 @@ pub struct Level {
     /// Root mean square over the interval. Zero when the interval
     /// contained no frames.
     pub rms: f32,
+    /// The longest run of consecutive full-scale samples in the
+    /// interval, where the backend counts them (the kernel driver does).
+    /// `None` where it does not; an over is then judged from the peak.
+    pub overs: Option<u32>,
 }
 
 impl Level {
@@ -152,7 +156,11 @@ impl Level {
     /// draws as "no RMS bar" rather than "silent". For backends that
     /// measure a maximum but not a mean.
     pub fn peak_only(peak: f32) -> Self {
-        Self { peak, rms: 0.0 }
+        Self {
+            peak,
+            rms: 0.0,
+            overs: None,
+        }
     }
 }
 

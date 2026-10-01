@@ -16,7 +16,7 @@ use tuxmix_core::{
 };
 
 use crate::matrix;
-use crate::meter_settings::{KScale, MeterSettings, PeakHold};
+use crate::meter_settings::{KScale, MeterSettings, OverSamples, PeakHold};
 use crate::osc::{self, OscCommand, OscConfig, OscOutbound};
 use crate::scenes::{load_scene_file, save_scene_file};
 use crate::sidebar::{self, Group};
@@ -498,7 +498,11 @@ impl DeviceHandle {
             levels: peak
                 .into_iter()
                 .zip(rms)
-                .map(|(peak, rms)| Level { peak, rms })
+                .map(|(peak, rms)| Level {
+                    peak,
+                    rms,
+                    overs: None,
+                })
                 .collect(),
             has_rms,
         }
@@ -860,6 +864,7 @@ pub enum Message {
     ToggleRmsPlus3,
     SetKScale(KScale),
     SetPeakHold(PeakHold),
+    SetOverSamples(OverSamples),
     /// Click on a strip's readout box: clear its held peak, RMS and over.
     ResetMeterReadout(ChannelId),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
@@ -1094,6 +1099,9 @@ pub struct Ballistics {
     /// slowly than peak, the same in both directions.
     pub rms_tau_ms: f32,
     pub hold_ms: f32,
+    /// Consecutive full-scale samples that make an over, where the
+    /// reading counts them.
+    pub over_samples: u32,
 }
 
 impl Default for Ballistics {
@@ -1102,6 +1110,7 @@ impl Default for Ballistics {
             rms_gain: 1.0,
             rms_tau_ms: 300.0,
             hold_ms: PEAK_HOLD_MS,
+            over_samples: 3,
         }
     }
 }
@@ -1171,9 +1180,15 @@ impl MeterAnim {
         self.has_rms = has_rms;
         self.max_peak = self.max_peak.max(level.peak);
         self.max_rms = self.max_rms.max(self.rms);
-        // Full scale is the largest value the stream can carry; an
-        // estimated output above it would clip on the card.
-        if level.peak >= 1.0 {
+        // With a count of full-scale samples (the kernel driver's), an
+        // over is that many in a row, as TotalMix counts them. Without
+        // one, a single full-scale peak: the largest value the stream can
+        // carry, or an estimated output mix that would clip on the card.
+        let over = match level.overs {
+            Some(run) => run >= b.over_samples,
+            None => level.peak >= 1.0,
+        };
+        if over {
             self.over = true;
         }
     }
@@ -1615,6 +1630,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::ToggleRmsPlus3
             | Message::SetKScale(_)
             | Message::SetPeakHold(_)
+            | Message::SetOverSamples(_)
             | Message::ResetMeterReadout(_)
             | Message::SnapshotStore
             | Message::GroupEditToggle
@@ -1668,6 +1684,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 rms_gain: if settings.rms_aes17() { RMS_PLUS3_GAIN } else { 1.0 },
                 rms_tau_ms: settings.rms_tau_ms(),
                 hold_ms: settings.peak_hold_s * 1000.0,
+                over_samples: settings.over_samples,
             };
             for (anims, readings) in [
                 (&mut state.input_meters, &in_levels),
@@ -2149,6 +2166,10 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::SetPeakHold(hold) => {
             state.meter_settings.peak_hold_s = hold.0;
+            save_meter_settings(state);
+        }
+        Message::SetOverSamples(n) => {
+            state.meter_settings.over_samples = n.0;
             save_meter_settings(state);
         }
         Message::ResetMeterReadout(cid) => {
@@ -3878,6 +3899,7 @@ mod tests {
         let level = Level {
             peak: 0.8,
             rms: 0.4,
+            overs: None,
         };
         let mut m = MeterAnim::new();
         m.step(level, true, Ballistics::default());
@@ -3898,6 +3920,7 @@ mod tests {
             Level {
                 peak: 0.5,
                 rms: 0.5,
+                overs: None,
             },
             true,
             Ballistics::default(),
@@ -3912,6 +3935,7 @@ mod tests {
         let sine = Level {
             peak: 1.0,
             rms: std::f32::consts::FRAC_1_SQRT_2,
+            overs: None,
         };
         for _ in 0..200 {
             m.step(sine, true, Ballistics { rms_gain: RMS_PLUS3_GAIN, ..Ballistics::default() });
@@ -3943,6 +3967,7 @@ mod tests {
         inputs.levels[0] = Level {
             peak: 0.5,
             rms: 0.25,
+            overs: None,
         };
         let playbacks = MeterReadings {
             levels: vec![Level::default(); dev.playbacks().len()],
@@ -4013,15 +4038,28 @@ mod tests {
     #[test]
     fn readout_holds_the_highest_peak_and_latches_an_over() {
         let mut m = MeterAnim::new();
-        m.step(Level { peak: 0.5, rms: 0.2 }, true, Ballistics::default());
-        m.step(Level { peak: 0.1, rms: 0.1 }, true, Ballistics::default());
+        m.step(Level { peak: 0.5, rms: 0.2, overs: None }, true, Ballistics::default());
+        m.step(Level { peak: 0.1, rms: 0.1, overs: None }, true, Ballistics::default());
         let r = m.readout();
         assert_eq!(r.peak, 0.5);
         assert!(r.rms.is_some_and(|rms| rms > 0.0));
         assert!(!r.over);
-        m.step(Level { peak: 1.0, rms: 0.5 }, true, Ballistics::default());
-        m.step(Level { peak: 0.0, rms: 0.0 }, true, Ballistics::default());
+        m.step(Level { peak: 1.0, rms: 0.5, overs: None }, true, Ballistics::default());
+        m.step(Level { peak: 0.0, rms: 0.0, overs: None }, true, Ballistics::default());
         assert!(m.readout().over, "an over stays until reset");
+    }
+
+    #[test]
+    fn an_over_needs_the_set_run_of_full_scale_samples_when_counted() {
+        let b = Ballistics { over_samples: 3, ..Ballistics::default() };
+        let mut m = MeterAnim::new();
+        m.step(Level { peak: 1.0, rms: 0.5, overs: Some(2) }, true, b);
+        assert!(!m.readout().over, "two full-scale samples are not an over at 3");
+        m.step(Level { peak: 1.0, rms: 0.5, overs: Some(3) }, true, b);
+        assert!(m.readout().over);
+        let mut uncounted = MeterAnim::new();
+        uncounted.step(Level { peak: 1.0, rms: 0.5, overs: None }, true, b);
+        assert!(uncounted.readout().over, "without a count, full scale is an over");
     }
 
     #[test]
@@ -4029,7 +4067,7 @@ mod tests {
         let fresh = || {
             let mut anims = vec![MeterAnim::new(); 4];
             for m in anims.iter_mut() {
-                m.step(Level { peak: 1.0, rms: 0.5 }, true, Ballistics::default());
+                m.step(Level { peak: 1.0, rms: 0.5, overs: None }, true, Ballistics::default());
             }
             anims
         };

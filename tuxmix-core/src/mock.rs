@@ -74,6 +74,7 @@ impl MockBabyfacePro {
         Level {
             peak: self.input_meter(idx),
             rms: self.input_rms.get(idx).copied().unwrap_or(0.0),
+            overs: None,
         }
     }
 
@@ -82,6 +83,7 @@ impl MockBabyfacePro {
         Level {
             peak: self.playback_meter(idx),
             rms: self.playback_rms.get(idx).copied().unwrap_or(0.0),
+            overs: None,
         }
     }
 

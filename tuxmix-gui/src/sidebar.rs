@@ -14,7 +14,7 @@ use iced::{Color, Element, Length};
 use tuxmix_core::{ChannelId, RmeDevice};
 
 use crate::app::{Message, TuxMix};
-use crate::meter_settings::{KScale, MeterSettings, PeakHold};
+use crate::meter_settings::{KScale, MeterSettings, OverSamples, PeakHold};
 use crate::theme;
 
 /// Fixed sidebar width (at `scale == 1.0`) — wide enough for the longest
@@ -362,7 +362,8 @@ fn segmented_row<'a>(
 /// The Options `meters` rows: a dimmed, inert "post fx" cell beside an
 /// independent "RMS +3 dB" on/off button (not a segmented pair: the two
 /// are separate settings, so turning one on must not light the other),
-/// then the scale (dBFS or a K-System scale) and the peak hold time. A
+/// then the scale (dBFS or a K-System scale), the peak hold time, and how
+/// many full-scale samples in a row make an over. A
 /// K-scale always uses AES17 RMS, so "RMS +3 dB" shows lit and inert then.
 fn meters_rows(settings: MeterSettings, scale: f32) -> Element<'static, Message> {
     let dim = Color {
@@ -403,6 +404,15 @@ fn meters_rows(settings: MeterSettings, scale: f32) -> Element<'static, Message>
             .menu_style(theme::menu),
         ]
         .spacing(theme::SPACE_TIGHT * scale),
+        pick_list(
+            OverSamples::CHOICES,
+            Some(OverSamples(settings.over_samples)),
+            Message::SetOverSamples
+        )
+        .text_size(theme::TEXT_XS * scale)
+        .width(Length::Fill)
+        .style(theme::pick_list)
+        .menu_style(theme::menu),
     ]
     .spacing(theme::SPACE_TIGHT * scale)
     .into()

@@ -72,6 +72,32 @@ impl std::fmt::Display for PeakHold {
     }
 }
 
+/// How many consecutive full-scale samples make an over, as the Options
+/// pick list shows it. TotalMix offers 1 to 10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverSamples(pub u32);
+
+impl OverSamples {
+    pub const CHOICES: [OverSamples; 10] = [
+        OverSamples(1),
+        OverSamples(2),
+        OverSamples(3),
+        OverSamples(4),
+        OverSamples(5),
+        OverSamples(6),
+        OverSamples(7),
+        OverSamples(8),
+        OverSamples(9),
+        OverSamples(10),
+    ];
+}
+
+impl std::fmt::Display for OverSamples {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OVR after {} smp", self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeterSettings {
     /// Lift RMS by 3 dB so a full-scale sine reads 0 dBFS on RMS as on
@@ -80,6 +106,10 @@ pub struct MeterSettings {
     /// How long a new peak holds before it falls, in seconds.
     pub peak_hold_s: f32,
     pub k_scale: KScale,
+    /// Consecutive full-scale samples that count as an over, where the
+    /// backend reports runs (the kernel driver does); elsewhere one
+    /// full-scale peak does.
+    pub over_samples: u32,
 }
 
 impl Default for MeterSettings {
@@ -88,6 +118,7 @@ impl Default for MeterSettings {
             rms_plus3: false,
             peak_hold_s: 1.0,
             k_scale: KScale::Off,
+            over_samples: 3,
         }
     }
 }
@@ -127,6 +158,7 @@ impl MeterSettings {
             "rms_plus3": self.rms_plus3,
             "peak_hold_s": self.peak_hold_s,
             "k_scale": self.k_scale.key(),
+            "over_samples": self.over_samples,
         })
     }
 
@@ -143,6 +175,10 @@ impl MeterSettings {
                 .as_str()
                 .and_then(KScale::from_key)
                 .unwrap_or(d.k_scale),
+            over_samples: v["over_samples"]
+                .as_u64()
+                .map(|n| n.clamp(1, 10) as u32)
+                .unwrap_or(d.over_samples),
         }
     }
 }
@@ -166,6 +202,7 @@ mod tests {
             rms_plus3: true,
             peak_hold_s: 3.0,
             k_scale: KScale::K14,
+            over_samples: 5,
         };
         assert_eq!(MeterSettings::from_json(&s.to_json()), s);
     }

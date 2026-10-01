@@ -62,6 +62,7 @@ impl MeterDir {
 struct MeterPair {
     peak: ElemId,
     rms: ElemId,
+    overs: ElemId,
 }
 
 impl MeterPair {
@@ -76,6 +77,7 @@ impl MeterPair {
         Self {
             peak: id("Peak"),
             rms: id("RMS"),
+            overs: id("Overs"),
         }
     }
 }
@@ -143,16 +145,24 @@ impl DriverMeters {
         };
         let peak = self.read_raw(&pair.peak).ok()?;
         let rms = self.read_raw(&pair.rms).ok()?;
-        Some(levels_from_raw(&peak, &rms))
+        // Optional: without it an over is judged from the peak alone.
+        let overs = self.read_raw(&pair.overs).ok();
+        Some(levels_from_raw(&peak, &rms, overs.as_ref()))
     }
 }
 
-/// Convert raw driver values to [`Level`]s.
-pub fn levels_from_raw(peak: &[i32; CHANNELS], rms: &[i32; CHANNELS]) -> [Level; CHANNELS] {
+/// Convert raw driver values to [`Level`]s. `overs` is the longest run
+/// of full-scale samples per channel, when the driver reported it.
+pub fn levels_from_raw(
+    peak: &[i32; CHANNELS],
+    rms: &[i32; CHANNELS],
+    overs: Option<&[i32; CHANNELS]>,
+) -> [Level; CHANNELS] {
     let scale = |v: i32| (v.max(0) as f32 / FULL_SCALE).min(1.0);
     std::array::from_fn(|i| Level {
         peak: scale(peak[i]),
         rms: scale(rms[i]),
+        overs: overs.map(|o| o[i].max(0) as u32),
     })
 }
 
@@ -168,12 +178,16 @@ mod tests {
         rms[0] = 0x5a_8279; // full-scale sine RMS, 1/sqrt(2)
         peak[1] = 0x40_0000; // -6 dBFS
         rms[2] = -5; // never negative from the driver; clamp anyway
-        let l = levels_from_raw(&peak, &rms);
+        let mut overs = [0; CHANNELS];
+        overs[0] = 4;
+        let l = levels_from_raw(&peak, &rms, Some(&overs));
+        assert_eq!(l[0].overs, Some(4));
+        assert_eq!(levels_from_raw(&peak, &rms, None)[0].overs, None);
         assert_eq!(l[0].peak, 1.0);
         assert!((l[0].rms - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
         assert!((20.0 * l[1].peak.log10() + 6.02).abs() < 0.01);
         assert_eq!(l[2].rms, 0.0);
-        assert_eq!(l[3], Level::default());
+        assert_eq!(l[3], Level { overs: Some(0), ..Level::default() });
     }
 
     #[test]
