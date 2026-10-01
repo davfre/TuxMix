@@ -973,23 +973,19 @@ pub struct TuxMix {
 /// forever.
 const OSC_LOG_MAX: usize = 500;
 
-/// Matches the `Tick` subscription interval below — the release curve is
-/// timed in real milliseconds rather than "per tick" so it stays correct if
-/// that interval ever changes.
+/// Matches the `Tick` subscription interval below — the peak hold and fall
+/// are timed in real milliseconds rather than "per tick" so they stay
+/// correct if that interval ever changes.
 const METER_TICK_MS: f32 = 50.0;
-/// Fast rise — a meter should jump to a new peak almost instantly so
-/// transients don't feel muted.
-const METER_ATTACK: f32 = 0.7;
-/// Release rate right after a peak: falls quickly at first...
-const METER_RELEASE_START: f32 = 0.22;
-/// ...decelerating to a gentle final approach as it settles, instead of
-/// falling at one constant rate the whole way down. This ease-out shape
-/// (fast-then-gentle) is the same curve easyeffects animates its meters
-/// with (a 300ms cubic ease-out) — it's what reads as a real analog needle
-/// settling rather than a value sliding down at a fixed speed.
-const METER_RELEASE_END: f32 = 0.04;
-/// Time to go from `METER_RELEASE_START` to `METER_RELEASE_END` after a peak.
-const METER_RELEASE_MS: f32 = 300.0;
+/// How long the peak stays at a new maximum before it starts to fall.
+pub(crate) const PEAK_HOLD_MS: f32 = 1000.0;
+/// How fast the peak falls once the hold is over, in dB per second: a
+/// fall at a constant rate in dB, as on a digital peak meter, about
+/// 20 dB in 1.7 s. Falling in dB rather than in linear amplitude keeps
+/// the speed the same at every height on the tapered scale.
+const PEAK_FALL_DB_PER_S: f32 = 12.0;
+/// Below this the falling peak is treated as silence.
+const PEAK_FLOOR: f32 = 1e-5;
 
 /// Per-channel VU ballistics state.
 #[derive(Clone, Copy, Debug)]
@@ -1002,10 +998,9 @@ pub struct MeterAnim {
     /// uses this to interpolate a smooth in-between value at full display
     /// refresh rate instead of jumping once per `Tick`.
     last_step_at: Instant,
-    /// Time since the level last rose (i.e. since the last peak) — drives
-    /// the release ease-out curve. Clamped at `METER_RELEASE_MS`, meaning
-    /// "fully settled into the tail rate".
-    release_elapsed_ms: f32,
+    /// What is left of the hold after the last new maximum; the peak
+    /// falls once this reaches zero.
+    hold_left_ms: f32,
     /// RMS, smoothed on its own slower time constant.
     prev_rms: f32,
     rms: f32,
@@ -1029,7 +1024,7 @@ impl MeterAnim {
             prev_value: 0.0,
             value: 0.0,
             last_step_at: Instant::now(),
-            release_elapsed_ms: METER_RELEASE_MS,
+            hold_left_ms: 0.0,
             prev_rms: 0.0,
             rms: 0.0,
             has_rms: false,
@@ -1049,9 +1044,9 @@ impl MeterAnim {
     }
 
     /// Advance one tick. `rms_gain` is 1.0, or `RMS_PLUS3_GAIN` with the
-    /// +3 dB option on.
-    fn step(&mut self, level: Level, has_rms: bool, rms_gain: f32) {
-        self.step_peak(level.peak);
+    /// +3 dB option on; `hold_ms` is how long a new peak holds.
+    fn step(&mut self, level: Level, has_rms: bool, rms_gain: f32, hold_ms: f32) {
+        self.step_peak(level.peak, hold_ms);
         self.prev_rms = self.rms;
         if has_rms {
             let target = (level.rms * rms_gain).clamp(0.0, 1.0);
@@ -1064,18 +1059,20 @@ impl MeterAnim {
         self.has_rms = has_rms;
     }
 
-    fn step_peak(&mut self, target: f32) {
+    /// A peak meter: a new maximum shows at once and holds for
+    /// `hold_ms`, then the reading falls at `PEAK_FALL_DB_PER_S` until it
+    /// meets the current level.
+    fn step_peak(&mut self, target: f32, hold_ms: f32) {
         self.prev_value = self.value;
         if target >= self.value {
-            self.value += (target - self.value) * METER_ATTACK;
-            self.release_elapsed_ms = 0.0;
+            self.value = target;
+            self.hold_left_ms = hold_ms;
+        } else if self.hold_left_ms > 0.0 {
+            self.hold_left_ms = (self.hold_left_ms - METER_TICK_MS).max(0.0);
         } else {
-            self.release_elapsed_ms =
-                (self.release_elapsed_ms + METER_TICK_MS).min(METER_RELEASE_MS);
-            let t = self.release_elapsed_ms / METER_RELEASE_MS;
-            let alpha = METER_RELEASE_END
-                + (METER_RELEASE_START - METER_RELEASE_END) * (1.0 - t) * (1.0 - t);
-            self.value += (target - self.value) * alpha;
+            let db = 20.0 * self.value.log10() - PEAK_FALL_DB_PER_S * METER_TICK_MS / 1000.0;
+            let fallen = 10f32.powf(db / 20.0);
+            self.value = if fallen < PEAK_FLOOR { target } else { fallen.max(target) };
         }
         self.last_step_at = Instant::now();
     }
@@ -1551,7 +1548,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 (&mut state.output_meters, &out_levels),
             ] {
                 for (i, m) in anims.iter_mut().enumerate() {
-                    m.step(readings.get(i), readings.has_rms, rms_gain);
+                    m.step(readings.get(i), readings.has_rms, rms_gain, PEAK_HOLD_MS);
                 }
             }
             // Persist the mixer state (debounced 3 s) — no hardware
@@ -3603,7 +3600,8 @@ mod tests {
     use super::{
         all_channel_ids, all_channels_muted, any_channel_soloed, apply_pending_resize,
         channel_is_muted, channel_is_soloed, new, power_sum_output_meters, update, zoom,
-        ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, RMS_PLUS3_GAIN, ZOOM_STEP,
+        ChannelId, DeviceHandle, MeterAnim, MeterReadings, Message, METER_TICK_MS, PEAK_FALL_DB_PER_S,
+        PEAK_HOLD_MS, RMS_PLUS3_GAIN, ZOOM_STEP,
     };
     use crate::sidebar;
     use crate::widgets::strip;
@@ -3656,14 +3654,14 @@ mod tests {
             rms: 0.4,
         };
         let mut m = MeterAnim::new();
-        m.step(level, true, 1.0);
+        m.step(level, true, 1.0, PEAK_HOLD_MS);
         let f = m.frame();
         let rms = f.rms.expect("RMS was measured");
         assert!(rms.value > 0.0 && rms.value < 0.4, "RMS eases in: {rms:?}");
 
         // The same backend going peak-only must stop drawing RMS rather
         // than freeze the last bar.
-        m.step(Level::peak_only(0.8), false, 1.0);
+        m.step(Level::peak_only(0.8), false, 1.0, PEAK_HOLD_MS);
         assert!(m.frame().rms.is_none());
     }
 
@@ -3677,6 +3675,7 @@ mod tests {
             },
             true,
             1.0,
+            PEAK_HOLD_MS,
         );
         let f = m.frame();
         assert!(f.rms.unwrap().value < f.value, "{f:?}");
@@ -3690,7 +3689,7 @@ mod tests {
             rms: std::f32::consts::FRAC_1_SQRT_2,
         };
         for _ in 0..200 {
-            m.step(sine, true, RMS_PLUS3_GAIN);
+            m.step(sine, true, RMS_PLUS3_GAIN, PEAK_HOLD_MS);
         }
         let rms = m.frame().rms.unwrap().value;
         // +3 dB is 1.4125, not exactly sqrt(2) (3.01 dB), so the sine
@@ -3787,46 +3786,51 @@ mod tests {
     }
 
     #[test]
-    fn attack_rises_fast() {
+    fn peak_rises_at_once() {
         let mut m = MeterAnim::new();
-        m.step_peak(1.0);
-        assert!(
-            m.frame().value > 0.5,
-            "one attack tick should jump most of the way: {}",
-            m.frame().value
-        );
+        m.step_peak(0.8, PEAK_HOLD_MS);
+        assert_eq!(m.frame().value, 0.8);
     }
 
     #[test]
-    fn release_decelerates_over_time() {
+    fn peak_holds_then_falls_at_a_constant_rate_in_db() {
         let mut m = MeterAnim::new();
-        m.step_peak(1.0); // reach a peak first
-        let peak = m.frame().value;
-
-        m.step_peak(0.0);
-        let drop_1 = peak - m.frame().value;
-
-        for _ in 0..10 {
-            m.step_peak(0.0);
+        m.step_peak(1.0, PEAK_HOLD_MS);
+        let hold_ticks = (PEAK_HOLD_MS / METER_TICK_MS) as usize;
+        for _ in 0..hold_ticks {
+            m.step_peak(0.0, PEAK_HOLD_MS);
         }
-        let before_late = m.frame().value;
-        m.step_peak(0.0);
-        let drop_late = before_late - m.frame().value;
-
-        assert!(
-            drop_1 > drop_late,
-            "first release tick should fall faster than a tick late into the release: {drop_1} vs {drop_late}"
-        );
+        assert_eq!(m.frame().value, 1.0, "the peak holds for the hold time");
+        let db = |v: f32| 20.0 * v.log10();
+        m.step_peak(0.0, PEAK_HOLD_MS);
+        let first = -db(m.frame().value);
+        for _ in 0..9 {
+            m.step_peak(0.0, PEAK_HOLD_MS);
+        }
+        let after_ten = -db(m.frame().value);
+        let per_tick = PEAK_FALL_DB_PER_S * METER_TICK_MS / 1000.0;
+        assert!((first - per_tick).abs() < 1e-3, "{first}");
+        assert!((after_ten - 10.0 * per_tick).abs() < 1e-2, "{after_ten}");
     }
 
     #[test]
-    fn rising_mid_release_cancels_it_and_resets_the_curve() {
+    fn falling_peak_stops_at_the_current_level() {
         let mut m = MeterAnim::new();
-        m.step_peak(1.0);
-        m.step_peak(0.0);
-        m.step_peak(0.0);
-        m.step_peak(1.0); // new peak — release curve should restart from here
-        assert_eq!(m.release_elapsed_ms, 0.0);
+        m.step_peak(1.0, 0.0);
+        for _ in 0..100 {
+            m.step_peak(0.5, 0.0);
+        }
+        assert_eq!(m.frame().value, 0.5);
+    }
+
+    #[test]
+    fn a_new_peak_restarts_the_hold() {
+        let mut m = MeterAnim::new();
+        m.step_peak(0.5, PEAK_HOLD_MS);
+        m.step_peak(0.0, PEAK_HOLD_MS);
+        m.step_peak(0.9, PEAK_HOLD_MS);
+        assert_eq!(m.hold_left_ms, PEAK_HOLD_MS);
+        assert_eq!(m.frame().value, 0.9);
     }
 
     // ── Right sidebar: Undo/Redo, Groups, Layout ──────────────────────
