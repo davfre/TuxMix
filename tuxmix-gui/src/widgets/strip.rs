@@ -226,6 +226,9 @@ pub struct StripParams<'a> {
 /// default 1.2x line-height also reserves descender space these glyphs
 /// (M, S, no descenders) never use, which reads as "sitting too high" once
 /// centered — tightening it to 1:1 removes that residual vertical bias.
+/// The button around it needs `.padding(0)`: the default padding leaves a
+/// short button less height than one line of text, which pushes the label
+/// down.
 fn centered_label<'a>(s: &'a str, size: f32) -> Element<'a, Message> {
     container(
         text(s)
@@ -376,6 +379,7 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
 
     let mute_btn = hint(
         button(centered_label("M", theme::TEXT_MICRO * scale))
+            .padding(0)
             .width(Length::Fill)
             .height(btn_h)
             .style(theme::toggle_button(p.mute, theme::MUTE_COLOR))
@@ -385,6 +389,7 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     );
     let solo_btn = hint(
         button(centered_label("S", theme::TEXT_MICRO * scale))
+            .padding(0)
             .width(Length::Fill)
             .height(btn_h)
             .style(theme::toggle_button(p.solo, theme::SOLO_COLOR))
@@ -487,6 +492,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
 
     let mute_btn = hint(
         button(centered_label("M", theme::TEXT_SM * scale))
+            .padding(0)
             .width(Length::Fill)
             .height(btn_h)
             .style(theme::toggle_button(p.mute, theme::MUTE_COLOR))
@@ -496,6 +502,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     );
     let solo_btn = hint(
         button(centered_label("S", theme::TEXT_SM * scale))
+            .padding(0)
             .width(Length::Fill)
             .height(btn_h)
             .style(theme::toggle_button(p.solo, theme::SOLO_COLOR))
@@ -511,6 +518,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     if p.has_cue {
         ms_row = ms_row.push(hint(
             button(centered_label("C", theme::TEXT_SM * scale))
+                .padding(0)
                 .width(Length::Fill)
                 .height(btn_h)
                 .style(theme::toggle_button(p.cue, theme::ACCENT))
