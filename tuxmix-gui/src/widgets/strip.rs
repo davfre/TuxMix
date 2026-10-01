@@ -11,7 +11,7 @@ use tuxmix_core::ChannelId;
 
 use crate::app::{db_text, short_label, Message, OUT_LABELS};
 use crate::theme;
-use crate::widgets::fader::{fader, vu_meter, Fader, MeterFrame};
+use crate::widgets::fader::{fader, vu_meter, Fader, MeterFrame, MeterScale};
 use crate::widgets::knob::{knob, Knob};
 
 /// Base sizes at `scale == 1.0` (`theme::SCALE_DEFAULT`) — every dimension
@@ -149,6 +149,9 @@ pub struct StripParams<'a> {
     /// every unlinked/mono strip.
     pub meter2: Option<MeterFrame>,
     pub meter2_available: bool,
+    /// The meter's dB scale: full scale for inputs and playbacks, with
+    /// headroom for the estimated output meters.
+    pub meter_scale: MeterScale,
     pub has_48v: bool,
     pub has_pad: bool,
     pub phantom: bool,
@@ -415,6 +418,7 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         solo_btn,
         container(vu_meter(
             p.meter,
+            p.meter_scale,
             COLLAPSED_METER_H * scale,
             scale,
             p.meter_available,
@@ -615,6 +619,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         meter_available: p.meter_available,
         meter2: p.meter2,
         meter2_available: p.meter2_available,
+        meter_scale: p.meter_scale,
         height: fader_h,
         show_meter: true,
         // The icon column (`icon_col`, built below) is this canvas's

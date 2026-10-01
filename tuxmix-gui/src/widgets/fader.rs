@@ -181,6 +181,59 @@ fn t_to_vol(t: f32) -> f32 {
     }
 }
 
+/// Bottom of every meter scale, in dBFS.
+const METER_FLOOR_DB: f32 = -60.0;
+
+/// The meter's own dB scale, separate from the fader's travel: from
+/// `METER_FLOOR_DB` up to `top_db`, on the same kind of taper the fader
+/// uses so the top of the column has the most resolution. Inputs and
+/// playbacks are measured on an integer stream that cannot pass full
+/// scale, so their meters end at 0 dBFS; the fader's +6 dB is gain, not
+/// a level a signal can reach there. Output meters are a host-side
+/// estimate of the card's own mix, which can exceed full scale, so they
+/// keep room above 0 to show it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeterScale {
+    pub top_db: f32,
+}
+
+impl MeterScale {
+    /// Ends at 0 dBFS: inputs and playbacks.
+    pub const FULL_SCALE: Self = Self { top_db: 0.0 };
+    /// Six dB above full scale: the estimated output meters.
+    pub const WITH_HEADROOM: Self = Self { top_db: 6.0 };
+
+    /// Fraction of the column height for a level in dB.
+    pub(crate) fn t_of_db(&self, db: f32) -> f32 {
+        let db = db.clamp(METER_FLOOR_DB, self.top_db);
+        let x = ((self.top_db - db) / (self.top_db - METER_FLOOR_DB)).clamp(0.0, 1.0);
+        (1.0 - x.powf(TAPER_K)).clamp(0.0, 1.0)
+    }
+
+    /// Fraction of the column height for a linear level (1.0 = 0 dBFS).
+    pub(crate) fn t_of(&self, l: f32) -> f32 {
+        if l <= 0.0 {
+            0.0
+        } else {
+            self.t_of_db(20.0 * l.log10())
+        }
+    }
+
+    /// The largest linear level the column can show.
+    fn max_level(&self) -> f32 {
+        10f32.powf(self.top_db / 20.0)
+    }
+
+    /// Ruler marks, in dBFS, top first.
+    fn ticks(&self) -> &'static [f32] {
+        if self.top_db > 0.0 {
+            &[6.0, 0.0, -6.0, -12.0, -20.0, -40.0, -60.0]
+        } else {
+            &[0.0, -6.0, -12.0, -20.0, -30.0, -40.0, -60.0]
+        }
+    }
+}
+
 pub struct Fader<Message> {
     pub value: f32,
     pub range: (f32, f32),
@@ -196,6 +249,8 @@ pub struct Fader<Message> {
     /// strip, unaffected.
     pub meter2: Option<MeterFrame>,
     pub meter2_available: bool,
+    /// The meter's dB scale, see [`MeterScale`].
+    pub meter_scale: MeterScale,
     pub height: f32,
     pub show_meter: bool,
     /// Extra width (at `scale == 1.0`... no, already-scaled pixels, same
@@ -526,12 +581,13 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
                 &mut frame,
                 meter_rect,
                 self.meter.reading_at(now),
+                self.meter_scale,
                 self.scale,
                 self.meter_available,
                 self.meter2
                     .map(|m| (m.reading_at(now), self.meter2_available)),
             );
-            draw_ruler(&mut frame, meter_rect, self.scale);
+            draw_ruler(&mut frame, meter_rect, self.meter_scale, self.scale);
         }
         let display_value = if state.dragging {
             self.value
@@ -661,12 +717,13 @@ fn draw_meter(
     frame: &mut Frame,
     r: Rectangle,
     level: MeterReading,
+    meter_scale: MeterScale,
     scale: f32,
     available: bool,
     right: Option<(MeterReading, bool)>,
 ) {
     let Some((level2, available2)) = right else {
-        draw_meter_bar(frame, r, level, scale, available);
+        draw_meter_bar(frame, r, level, meter_scale, scale, available);
         return;
     };
     let gap = 1.0 * scale;
@@ -676,8 +733,8 @@ fn draw_meter(
         Point::new(r.x + half_w + gap, r.y),
         Size::new(half_w, r.height),
     );
-    draw_meter_bar(frame, left_rect, level, scale, available);
-    draw_meter_bar(frame, right_rect, level2, scale, available2);
+    draw_meter_bar(frame, left_rect, level, meter_scale, scale, available);
+    draw_meter_bar(frame, right_rect, level2, meter_scale, scale, available2);
 }
 
 /// Height of the peak marker drawn over an RMS fill, at `scale == 1.0`.
@@ -693,10 +750,10 @@ fn level_color(l: f32, alpha: f32) -> Color {
     }
 }
 
-/// Where a level lands in the column, as a y coordinate. Uses the tapered
-/// fader curve so a level lines up with its ruler tick.
-fn level_top(r: Rectangle, l: f32) -> f32 {
-    r.y + r.height - r.height * vol_to_t(l)
+/// Where a level lands in the column, as a y coordinate, on the meter's
+/// own scale so a level lines up with its ruler tick.
+fn level_top(r: Rectangle, l: f32, meter_scale: MeterScale) -> f32 {
+    r.y + r.height - r.height * meter_scale.t_of(l)
 }
 
 /// With RMS, the fill shows RMS and a thin line marks the peak above it,
@@ -706,10 +763,11 @@ fn draw_meter_bar(
     frame: &mut Frame,
     r: Rectangle,
     level: MeterReading,
+    meter_scale: MeterScale,
     scale: f32,
     available: bool,
 ) {
-    let l = level.peak.clamp(0.0, 1.0);
+    let l = level.peak.clamp(0.0, meter_scale.max_level());
     let fill_l = level.rms.map_or(l, |rms| rms.clamp(0.0, l));
     let fill_w = r.width;
     let radius = METER_RADIUS * scale;
@@ -756,16 +814,10 @@ fn draw_meter_bar(
     }
 
     if fill_l > 0.0 {
-        // `l` is linear amplitude (1.0 = 0 dBFS), but the ruler's
-        // ticks — and the fader track right next to this column — are
-        // positioned on the *tapered* dB curve (`db_to_t`/`vol_to_t`),
-        // not linearly. Filling by raw `l` used to land a -6 dBFS
-        // signal's fill top well below the "-6" gridline instead of
-        // right at it (checked: `vol_to_t(0.5)` ≈ 0.63, not 0.5) — real
-        // signal data only started flowing through here this session
-        // (previously every real backend read "N/A"), which is what
-        // made this actually matter rather than being a latent bug.
-        let fill_top = level_top(r, fill_l);
+        // `l` is linear amplitude (1.0 = 0 dBFS), but the ruler's ticks
+        // are positioned on the meter's tapered dB scale, not linearly,
+        // so the fill goes through the same scale to line up with them.
+        let fill_top = level_top(r, fill_l, meter_scale);
         let fill_h = r.y + r.height - fill_top;
         let fill_pos = Point::new(r.x, fill_top);
         frame.fill(
@@ -779,7 +831,7 @@ fn draw_meter_bar(
         // the ruler digits. Kept inside the column so it never overlaps
         // the clip LED's rounded ends.
         let line_h = PEAK_LINE_H * scale;
-        let y = safe_clamp(level_top(r, l), r.y, r.y + r.height - line_h);
+        let y = safe_clamp(level_top(r, l, meter_scale), r.y, r.y + r.height - line_h);
         frame.fill_rectangle(
             Point::new(r.x, y),
             Size::new(fill_w, line_h),
@@ -789,7 +841,9 @@ fn draw_meter_bar(
 
     // Clip LED — a fixed indicator above the track, dim until triggered.
     let clip_rect = Rectangle::new(Point::new(r.x, r.y), Size::new(fill_w, clip_h));
-    let clipping = l >= 0.95;
+    // At or above full scale: the largest value an input or playback can
+    // carry, or an estimated output mix that would clip.
+    let clipping = l >= 1.0;
     let clip_color = if clipping {
         Color {
             a: FILL_ALPHA,
@@ -946,21 +1000,16 @@ fn draw_track(
 /// needs to stay legible against whatever color is lit behind it —
 /// numbers centered in the same rect `draw_meter` just filled, TotalMix-
 /// style, rather than pushed into their own lane to one side of it. The
-/// tick dash sits at the rect's own right edge — right where the fader
-/// track begins right after it (see `Fader::layout_x`), the same
-/// "shared between the meter and the fader" position the reference uses.
-fn draw_ruler(frame: &mut Frame, r: Rectangle, scale: f32) {
-    const TICKS: [f32; 6] = [0.0, -6.0, -10.0, -20.0, -40.0, -60.0];
+/// marks are the meter's own scale ([`MeterScale`]), not the fader's, so
+/// the tick dashes sit on the meter's left edge, away from the fader
+/// track they would otherwise seem to label.
+fn draw_ruler(frame: &mut Frame, r: Rectangle, meter_scale: MeterScale, scale: f32) {
     let label_color = theme::TEXT_SEC;
-    let tick_x1 = r.x + r.width;
-    let tick_x0 = tick_x1 - 3.0 * scale;
+    let tick_x0 = r.x;
+    let tick_x1 = tick_x0 + 3.0 * scale;
     let label_x = r.x + r.width / 2.0;
-    // Measured against the *full* `r`, matching `draw_track`'s own
-    // `pos_of` (the fader cap) and, since the fix noted in `draw_meter`,
-    // that function's fill too — all three now agree on where a given
-    // dB value sits.
-    for db in TICKS {
-        let t = db_to_t(db);
+    for &db in meter_scale.ticks() {
+        let t = meter_scale.t_of_db(db);
         let y = r.y + r.height - r.height * t;
         let y = safe_clamp(y, r.y + 4.0 * scale, r.y + r.height - 4.0 * scale);
 
@@ -970,7 +1019,9 @@ fn draw_ruler(frame: &mut Frame, r: Rectangle, scale: f32) {
             Stroke::default().with_color(label_color).with_width(1.0),
         );
 
-        let label = if db == 0.0 {
+        let label = if db > 0.0 {
+            format!("+{}", db as i32)
+        } else if db == 0.0 {
             "0".to_string()
         } else {
             format!("{}", -db as i32)
@@ -1013,6 +1064,7 @@ where
 /// (fader, mute/solo, pan) for a glance-only level readout.
 struct VuMeter {
     level: MeterFrame,
+    meter_scale: MeterScale,
     scale: f32,
     available: bool,
 }
@@ -1055,6 +1107,7 @@ impl<Message> canvas::Program<Message> for VuMeter {
             &mut frame,
             meter_rect,
             self.level.reading_at(Instant::now()),
+            self.meter_scale,
             self.scale,
             self.available,
             // Collapsed strips are a glance-only view with no room for a
@@ -1062,19 +1115,21 @@ impl<Message> canvas::Program<Message> for VuMeter {
             // for this pass, single-bar only here.
             None,
         );
-        draw_ruler(&mut frame, meter_rect, self.scale);
+        draw_ruler(&mut frame, meter_rect, self.meter_scale, self.scale);
         vec![frame.into_geometry()]
     }
 }
 
 pub fn vu_meter<'a, Message: 'a>(
     level: MeterFrame,
+    meter_scale: MeterScale,
     height: f32,
     scale: f32,
     available: bool,
 ) -> Element<'a, Message> {
     Canvas::new(VuMeter {
         level,
+        meter_scale,
         scale,
         available,
     })
@@ -1089,22 +1144,32 @@ mod tests {
 
     #[test]
     fn meter_fill_curve_is_tapered_not_linear() {
-        // Guards `draw_meter`'s fill-height fix: a -6 dBFS signal
-        // (linear amplitude 0.5) must land its fill top at the
-        // ruler's own tapered "-6" position, not halfway up the
-        // column — the bug this fixed used raw linear amplitude
-        // directly as the fill fraction, which would make this
-        // assertion fail (0.5 vs 0.5, no taper).
-        let t = vol_to_t(0.5);
+        // A -6 dBFS signal (linear 0.5) must land its fill top at the
+        // ruler's tapered "-6" mark, not halfway up the column.
+        let t = MeterScale::FULL_SCALE.t_of(0.5);
         assert!(
             (t - 0.5).abs() > 0.1,
             "expected the tapered curve to differ meaningfully from linear 0.5, got {t}"
         );
-        // And it should match `db_to_t` fed the actual dB value,
-        // since that's what the ruler's own ticks use — the whole
-        // point is these two agree.
-        let expected = db_to_t(20.0 * 0.5f32.log10());
+        let expected = MeterScale::FULL_SCALE.t_of_db(20.0 * 0.5f32.log10());
         assert!((t - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn full_scale_meter_tops_out_at_zero_dbfs() {
+        let s = MeterScale::FULL_SCALE;
+        assert_eq!(s.t_of(1.0), 1.0);
+        assert!(s.t_of(0.5) < 1.0);
+        assert_eq!(s.t_of(0.0), 0.0);
+        assert_eq!(s.t_of_db(METER_FLOOR_DB), 0.0);
+    }
+
+    #[test]
+    fn output_meter_keeps_room_above_full_scale() {
+        let s = MeterScale::WITH_HEADROOM;
+        assert!(s.t_of(1.0) < 1.0, "0 dBFS must sit below the top");
+        assert!((s.t_of(2.0) - 1.0).abs() < 1e-3, "+6 dB is the top");
+        assert!((s.max_level() - 1.995).abs() < 0.01);
     }
 
     #[test]

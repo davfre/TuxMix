@@ -25,7 +25,7 @@ use tuxmix_core::{ChannelId, ChannelType, RmeDevice};
 
 use crate::app::{pair_bus_label, Message, TuxMix, OUT_LABELS};
 use crate::theme;
-use crate::widgets::fader::{fader, Fader, MeterFrame};
+use crate::widgets::fader::{fader, Fader, MeterFrame, MeterScale};
 
 /// Column width / row height at `scale == 1.0` — sized for a 2-3
 /// character dB value, not a fader track.
@@ -89,6 +89,7 @@ fn interactive_cell(
         meter_available: false,
         meter2: None,
         meter2_available: false,
+        meter_scale: MeterScale::FULL_SCALE,
         height: CELL_H * scale,
         show_meter: false,
         reserved_right: 0.0,

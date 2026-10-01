@@ -2617,6 +2617,7 @@ fn strip_params<'a>(
         meter_available: false,
         meter2: None,
         meter2_available: false,
+        meter_scale: fader::MeterScale::FULL_SCALE,
         has_48v: false,
         has_pad: false,
         phantom: false,
@@ -2733,6 +2734,9 @@ fn strip_params<'a>(
                 // `DeviceHandle::output_meters`).
                 meter_available: state.device.has_input_meters()
                     || state.device.has_playback_meters(),
+                // The output meters estimate the card's own mix, which
+                // can pass full scale.
+                meter_scale: fader::MeterScale::WITH_HEADROOM,
                 loopback: ch.loopback,
                 stereo_linked: state.device.output_linked(i / 2),
                 mute: ch.mute,
